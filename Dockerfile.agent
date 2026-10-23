@@ -4,6 +4,7 @@ RUN test -n "$CODEX_VERSION" \
     && apt-get update && apt-get install -y --no-install-recommends git python3 ca-certificates ripgrep \
     && rm -rf /var/lib/apt/lists/* \
     && npm install --global "@openai/codex@${CODEX_VERSION}"
+RUN mkdir -p /home/node/.codex && chown node:node /home/node/.codex && chmod 700 /home/node/.codex
 # Extend this image with your project's compilers/package managers as needed.
 USER node
 WORKDIR /repo

@@ -15,11 +15,11 @@ All services poll independently. A shared file lock serializes controller work, 
 
 ## Start
 
-Requires a Linux Docker host, Docker Compose v2, GitHub tokens, and an OpenAI API key. API usage is billed to that key. There is no dependency on the ChatGPT browser session.
+Requires a Linux Docker host, Docker Compose v2, GitHub tokens, and either a Codex CLI sign-in or an OpenAI API key. The default `AUTH_MODE=codex` uses a dedicated saved Codex sign-in; it does not reuse this chat or the browser session automatically.
 
 1. Copy this directory onto a dedicated runner and `cd` into it.
 2. `cp .env.example .env` and `chmod 600 .env`.
-3. Set `GITHUB_REPOSITORY`, `REVIEWER_LOGIN`, token values and `OPENAI_API_KEY`.
+3. Set `GITHUB_REPOSITORY`, `REVIEWER_LOGIN`, token values. Choose authentication as described below; `OPENAI_API_KEY` is optional in Codex sign-in mode.
 4. Resolve a published CLI version with `npm view @openai/codex version`; put that exact version in `CODEX_VERSION`. Models are optional overrides; otherwise the pinned CLI chooses its default. Extend `Dockerfile.agent` for project-specific tools such as Rust, Java or pnpm.
 5. Create the absolute `WORK_ROOT` directory on the Docker host. It must have the same absolute path inside controllers. Do not use a remote Docker daemon or Docker Desktop path translation with this setup.
 6. Set `REQUIRED_CHECKS` to your exact CI job/check names, e.g. `test,lint`. Branch protection must require those same checks.
@@ -29,6 +29,11 @@ Requires a Linux Docker host, Docker Compose v2, GitHub tokens, and an OpenAI AP
 ```sh
 docker compose --profile build build agent-image
 docker compose build implement
+# One-time sign-in for AUTH_MODE=codex:
+docker compose --profile auth run --rm login
+# Complete the device-login link and code in your own browser.
+docker compose --profile auth run --rm login login status
+
 docker compose up -d implement review merge improve
 docker compose logs -f
 ```
@@ -45,6 +50,28 @@ gh label create agent:improvement --repo OWNER/REPO --color 1D76DB
 Create an issue with a concrete goal, acceptance criteria and useful test commands. Add `agent:ready`. The implementer opens a PR; the reviewer either approves it or requests specific changes. Fixes trigger another review on the new commit. Failed checks supply their output, links and annotations to the repair job, which can reproduce failures locally. Raw GitHub Actions log archives are not fetched in this version.
 
 For a first run keep `AUTO_MERGE=false`. After configuring the branch rules below, set `AUTO_MERGE=true` and recreate the merge service with `docker compose up -d merge`. This is a real unattended merge capability once enabled.
+
+## Codex credentials or API key
+
+`AUTH_MODE=codex` uses your ChatGPT/Codex account instead of an API key. The one-time `login` service runs `codex login --device-auth`; enable device-code sign-in in your ChatGPT security settings if needed. Complete the printed sign-in link and code yourself. Never paste credentials, the device code or `auth.json` into GitHub issues or chat.
+
+The dedicated Docker volume named by `CODEX_AUTH_VOLUME` stores the CLI auth cache. Disposable implementation, review and improvement jobs mount that same volume writable so Codex can persist token refreshes for the next job. The global controller lock serializes these jobs. Sign-in usage counts against your account's Codex allowance and can hit plan limits; it is not unlimited. Availability depends on your plan and workspace settings.
+
+If device login is unavailable, stop the loops and authenticate locally with file-based storage (`codex -c 'cli_auth_credentials_store="file"' login`). Transfer only that dedicated login's `auth.json` securely into the volume, owned by UID 1000 with mode 600. Do not mount your entire personal Codex home directory. A local OS keychain login is not automatically available inside Docker. The device-login path avoids copying credentials altogether.
+
+For usage-based API billing set `AUTH_MODE=api` and `OPENAI_API_KEY` in `.env`, then recreate `implement`, `review` and `improve`. API mode does not mount the account credential volume. Authentication never silently falls back between modes.
+
+For renewal or logout, stop active controllers and jobs first, then run:
+
+```sh
+docker compose stop
+docker compose --profile auth run --rm login login status
+docker compose --profile auth run --rm login login --device-auth
+# To revoke the saved runner login instead:
+# docker compose --profile auth run --rm login logout
+```
+
+Keep the volume between restarts; `docker compose down -v` deletes the saved login. Protect volume backups as credentials. Do not run another stack or desktop CLI concurrently against this credential cache; use a distinct dedicated login/volume per runner. GitHub tokens are still required separately. Official OpenAI guidance recommends API keys as the default for programmatic CI/CD; saved account auth is an advanced option for trusted runners.
 
 ## GitHub identities and permissions
 
@@ -89,9 +116,9 @@ Model suggestions cannot change merge policy. The publisher rejects `.github/`, 
 - Deterministic branch names, PR lookup, creation-only branch pushes, and force-with-lease repair pushes prevent duplicate PRs and accidental overwriting of concurrently updated branches. Recovery covers a successful push followed by a failed PR creation.
 - Existing unrelated PRs and fork PRs are not adopted. Closing a tracked PR does not automatically start another PR for that issue.
 - CI reruns on the same commit are reread; latest commit statuses supersede older failures. A missing pipeline remains blocked. This starter fixes completed failures, not queued jobs or infrastructure outages; inspect those manually.
-- One model job times out after `JOB_TIMEOUT_SECONDS` (default 30 minutes), with 2 CPUs and 4 GiB RAM. These bound execution, not dollar spend; set project-level API budgets/rate limits separately.
+- One model job times out after `JOB_TIMEOUT_SECONDS` (default 30 minutes), with 2 CPUs and 4 GiB RAM. These bound execution, not dollar spend; set project-level API budgets/rate limits in API mode, or monitor your Codex plan allowance in account mode.
 - `WORK_ROOT/job-*/output/` retains model logs and summaries. The reviewer gets source read-only and can compare `/repo` to `/base`. Jobs have no GitHub token, no Docker socket, and no controller state mount. Logs and source may contain sensitive repository data; retain/prune them according to your needs. No automatic disk cleanup is included.
-- Agents run in disposable containers with dropped capabilities and no host networking. Their writable source has no controller Git metadata. GitHub pushes/reviews/merges happen only in trusted controllers. OpenAI credentials and outbound network are available in jobs; use a limited project key. Docker containers are not a hardened hostile-code sandbox. Controllers with the Docker socket have host-level power: use a dedicated runner, not your everyday workstation or production host. Network egress restrictions and microVM isolation are deployment extensions.
+- Agents run in disposable containers with dropped capabilities and no host networking. Their writable source has no controller Git metadata. GitHub pushes/reviews/merges happen only in trusted controllers. Model credentials and outbound network are available in jobs: the dedicated saved sign-in in Codex mode, or a limited project key in API mode. Docker containers are not a hardened hostile-code sandbox. Controllers with the Docker socket have host-level power: use a dedicated runner, not your everyday workstation or production host. Network egress restrictions and microVM isolation are deployment extensions.
 - A hard host/controller crash can leave orphan job containers. Stop those before restarting work. The file lock is intentionally local and does not coordinate separate runner hosts.
 
 ## Verification
@@ -106,6 +133,7 @@ The automated suite exercises review/check gates, pagination, durable attempt li
 
 Official references:
 
+- [Codex authentication, device login and credential storage](https://learn.chatgpt.com/docs/auth)
 - [Codex non-interactive execution and structured output](https://learn.chatgpt.com/docs/non-interactive-mode)
 - [GitHub pull request reviews](https://docs.github.com/en/rest/pulls/reviews)
 - [GitHub merge API and expected SHA](https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request)

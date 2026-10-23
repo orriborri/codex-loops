@@ -30,6 +30,27 @@ def run(args, cwd=None, env=None, timeout=300, input=None):
     return result.stdout.strip()
 
 
+def agent_auth():
+    """Select auth explicitly; never silently fall back to billed API usage."""
+    env = dict(os.environ)
+    env.pop('CODEX_API_KEY', None)
+    env.pop('OPENAI_API_KEY', None)
+    mode = os.getenv('AUTH_MODE', 'codex')
+    if mode == 'codex':
+        volume = os.getenv('CODEX_AUTH_VOLUME', 'codex-loops-auth')
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', volume):
+            raise ValueError('CODEX_AUTH_VOLUME must be a Docker named volume')
+        return ['--env', 'CODEX_HOME=/home/node/.codex', '--mount',
+                f'type=volume,src={volume},dst=/home/node/.codex'], env
+    if mode == 'api':
+        key = os.getenv('OPENAI_API_KEY', '')
+        if not key:
+            raise ValueError('AUTH_MODE=api requires OPENAI_API_KEY')
+        env['CODEX_API_KEY'] = key
+        return ['--env', 'CODEX_HOME=/tmp/codex', '--env', 'CODEX_API_KEY'], env
+    raise ValueError('AUTH_MODE must be codex or api')
+
+
 class GitHub:
     def __init__(self, repo, token):
         self.root = f'https://api.github.com/repos/{repo}'
@@ -183,16 +204,17 @@ class Loops:
                                      'body': {'type': 'string'}},
                       'required': ['needed', 'title', 'body']}
         (output / 'schema.json').write_text(json.dumps(schema))
+        auth_args, job_env = agent_auth()
         name = 'codex-job-' + uuid.uuid4().hex
         command = ['docker', 'run', '--rm', '--init', '--name', name, '--user', '1000:1000',
                    '--cap-drop=ALL', '--security-opt=no-new-privileges', '--read-only',
                    '--pids-limit=256', '--memory', os.getenv('JOB_MEMORY', '4g'), '--cpus',
                    os.getenv('JOB_CPUS', '2'), '--tmpfs', '/tmp:rw,exec,size=1g,mode=1777',
-                   '--env', 'HOME=/tmp/home', '--env', 'CODEX_HOME=/tmp/codex',
-                   '--env', 'CODEX_API_KEY',
+                   '--env', 'HOME=/tmp/home', *auth_args,
                    '--mount', f'type=bind,src={source},dst=/repo' + (',readonly' if review else ''),
                    '--mount', f'type=bind,src={output},dst=/out', '--workdir', '/repo',
-                   os.getenv('AGENT_IMAGE', 'codex-loops-agent:local'), 'codex', 'exec',
+                   os.getenv('AGENT_IMAGE', 'codex-loops-agent:local'), 'codex',
+                   '-c', 'cli_auth_credentials_store="file"', 'exec',
                    '--skip-git-repo-check', '--ephemeral', '--sandbox', 'danger-full-access',
                    '--output-last-message', '/out/result.json' if review else '/out/result.txt']
         if baseline is not None:
@@ -208,7 +230,7 @@ class Loops:
             # Keep logs outside model-writable source, preserve them for diagnosis.
             with (output / 'events.log').open('w') as log:
                 result = subprocess.run(command, input=prompt, text=True, stdout=log,
-                    stderr=log, env={**os.environ, 'CODEX_API_KEY': os.environ['OPENAI_API_KEY']},
+                    stderr=log, env=job_env,
                     timeout=int(os.getenv('JOB_TIMEOUT_SECONDS', '1800')))
                 if result.returncode:
                     raise RuntimeError('Codex job failed; inspect output/events.log')

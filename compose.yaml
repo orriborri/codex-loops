@@ -14,6 +14,8 @@ x-common: &common
     AGENT_IMAGE: codex-loops-agent:local
     IMPLEMENT_MODEL: ${IMPLEMENT_MODEL:-}
     REVIEW_MODEL: ${REVIEW_MODEL:-}
+    AUTH_MODE: ${AUTH_MODE:-codex}
+    CODEX_AUTH_VOLUME: ${CODEX_AUTH_VOLUME:-codex-loops-auth}
     JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-1800}
   volumes:
     - ${WORK_ROOT}:${WORK_ROOT}
@@ -29,13 +31,26 @@ services:
         CODEX_VERSION: ${CODEX_VERSION:?Pin an installed Codex CLI version}
     entrypoint: [codex, --version]
 
+  login:
+    profiles: [auth]
+    image: codex-loops-agent:local
+    user: "1000:1000"
+    stdin_open: true
+    tty: true
+    environment:
+      CODEX_HOME: /home/node/.codex
+    volumes:
+      - codex-auth:/home/node/.codex
+    entrypoint: [codex, -c, 'cli_auth_credentials_store="file"']
+    command: [login, --device-auth]
+
   implement:
     <<: *common
     command: implement
     environment:
       <<: *environment
       GH_TOKEN: ${IMPLEMENT_GITHUB_TOKEN:?Set implementation token}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:?Set OpenAI key}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     volumes:
       - ${WORK_ROOT}:${WORK_ROOT}
       - /var/run/docker.sock:/var/run/docker.sock
@@ -46,7 +61,7 @@ services:
     environment:
       <<: *environment
       GH_TOKEN: ${REVIEW_GITHUB_TOKEN:?Use a separate reviewer identity}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:?Set OpenAI key}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     volumes:
       - ${WORK_ROOT}:${WORK_ROOT}
       - /var/run/docker.sock:/var/run/docker.sock
@@ -65,10 +80,14 @@ services:
     environment:
       <<: *environment
       GH_TOKEN: ${IMPROVE_GITHUB_TOKEN:?Set issue creation/read token}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:?Set OpenAI key}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       POLL_SECONDS: 600
       AUTO_QUEUE_IMPROVEMENTS: ${AUTO_QUEUE_IMPROVEMENTS:-false}
       MAX_OPEN_IMPROVEMENTS: ${MAX_OPEN_IMPROVEMENTS:-3}
     volumes:
       - ${WORK_ROOT}:${WORK_ROOT}
       - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  codex-auth:
+    name: ${CODEX_AUTH_VOLUME:-codex-loops-auth}

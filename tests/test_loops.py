@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from loop import GitHub, Loops, State, check_gate, review_gate
+from loop import GitHub, Loops, State, agent_auth, check_gate, review_gate
 
 
 def review(user='review-bot', state='APPROVED', sha='head', id=1):
@@ -101,6 +101,45 @@ class Gates(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(RuntimeError, 'Protected'):
                 loops.publish(Path(directory), Path(directory), 'agent/issue-1')
+
+
+class Authentication(unittest.TestCase):
+    def test_codex_mode_uses_persistent_volume_without_api_key(self):
+        with patch.dict(os.environ, {'AUTH_MODE': 'codex', 'CODEX_AUTH_VOLUME': 'runner-auth',
+                                      'OPENAI_API_KEY': 'fake-secret', 'CODEX_API_KEY': 'stale-secret'}):
+            args, env = agent_auth()
+        self.assertIn('type=volume,src=runner-auth,dst=/home/node/.codex', args)
+        self.assertNotIn('CODEX_API_KEY', env)
+        self.assertNotIn('OPENAI_API_KEY', env)
+        self.assertNotIn('fake-secret', ' '.join(args))
+
+    def test_api_mode_only_passes_key_in_environment(self):
+        with patch.dict(os.environ, {'AUTH_MODE': 'api', 'OPENAI_API_KEY': 'fake-secret'}):
+            args, env = agent_auth()
+        self.assertEqual(env['CODEX_API_KEY'], 'fake-secret')
+        self.assertNotIn('fake-secret', ' '.join(args))
+        self.assertFalse(any('type=volume' in x for x in args))
+
+    def test_api_mode_never_falls_back_to_saved_login(self):
+        with patch.dict(os.environ, {'AUTH_MODE': 'api', 'OPENAI_API_KEY': ''}):
+            with self.assertRaisesRegex(ValueError, 'requires OPENAI_API_KEY'):
+                agent_auth()
+
+    def test_invalid_auth_mode_rejected(self):
+        with patch.dict(os.environ, {'AUTH_MODE': 'typo'}):
+            with self.assertRaisesRegex(ValueError, 'AUTH_MODE must be'):
+                agent_auth()
+
+    def test_mount_injection_rejected(self):
+        with patch.dict(os.environ, {'AUTH_MODE': 'codex', 'CODEX_AUTH_VOLUME': '/host,dst=/escape'}):
+            with self.assertRaisesRegex(ValueError, 'named volume'):
+                agent_auth()
+
+    def test_default_auth_uses_codex_without_api_environment(self):
+        with patch.dict(os.environ, {}, clear=True):
+            args, env = agent_auth()
+        self.assertIn('type=volume,src=codex-loops-auth,dst=/home/node/.codex', args)
+        self.assertNotIn('CODEX_API_KEY', env)
 
 
 class MergeController(unittest.TestCase):
