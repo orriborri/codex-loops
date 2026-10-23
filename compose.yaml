@@ -1,0 +1,74 @@
+x-common: &common
+  image: codex-loops-controller:local
+  build: .
+  restart: unless-stopped
+  init: true
+  environment: &environment
+    GITHUB_REPOSITORY: ${GITHUB_REPOSITORY:?Set owner/repository}
+    WORK_ROOT: ${WORK_ROOT:?Use an absolute host path}
+    BASE_BRANCH: ${BASE_BRANCH:-main}
+    REVIEWER_LOGIN: ${REVIEWER_LOGIN:?Set the review bot login}
+    REQUIRED_CHECKS: ${REQUIRED_CHECKS:?Set comma-separated CI check names}
+    POLL_SECONDS: ${POLL_SECONDS:-30}
+    MAX_FIX_ATTEMPTS: ${MAX_FIX_ATTEMPTS:-5}
+    AGENT_IMAGE: codex-loops-agent:local
+    IMPLEMENT_MODEL: ${IMPLEMENT_MODEL:-}
+    REVIEW_MODEL: ${REVIEW_MODEL:-}
+    JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-1800}
+  volumes:
+    - ${WORK_ROOT}:${WORK_ROOT}
+
+services:
+  agent-image:
+    profiles: [build]
+    image: codex-loops-agent:local
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+      args:
+        CODEX_VERSION: ${CODEX_VERSION:?Pin an installed Codex CLI version}
+    entrypoint: [codex, --version]
+
+  implement:
+    <<: *common
+    command: implement
+    environment:
+      <<: *environment
+      GH_TOKEN: ${IMPLEMENT_GITHUB_TOKEN:?Set implementation token}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?Set OpenAI key}
+    volumes:
+      - ${WORK_ROOT}:${WORK_ROOT}
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  review:
+    <<: *common
+    command: review
+    environment:
+      <<: *environment
+      GH_TOKEN: ${REVIEW_GITHUB_TOKEN:?Use a separate reviewer identity}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?Set OpenAI key}
+    volumes:
+      - ${WORK_ROOT}:${WORK_ROOT}
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  merge:
+    <<: *common
+    command: merge
+    environment:
+      <<: *environment
+      GH_TOKEN: ${MERGE_GITHUB_TOKEN:?Set merge token}
+      AUTO_MERGE: ${AUTO_MERGE:-false}
+
+  improve:
+    <<: *common
+    command: improve
+    environment:
+      <<: *environment
+      GH_TOKEN: ${IMPROVE_GITHUB_TOKEN:?Set issue creation/read token}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:?Set OpenAI key}
+      POLL_SECONDS: 600
+      AUTO_QUEUE_IMPROVEMENTS: ${AUTO_QUEUE_IMPROVEMENTS:-false}
+      MAX_OPEN_IMPROVEMENTS: ${MAX_OPEN_IMPROVEMENTS:-3}
+    volumes:
+      - ${WORK_ROOT}:${WORK_ROOT}
+      - /var/run/docker.sock:/var/run/docker.sock

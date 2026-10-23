@@ -1,0 +1,9 @@
+FROM node:22-bookworm-slim
+ARG CODEX_VERSION
+RUN test -n "$CODEX_VERSION" \
+    && apt-get update && apt-get install -y --no-install-recommends git python3 ca-certificates ripgrep \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install --global "@openai/codex@${CODEX_VERSION}"
+# Extend this image with your project's compilers/package managers as needed.
+USER node
+WORKDIR /repo
