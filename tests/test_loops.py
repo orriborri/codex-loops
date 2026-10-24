@@ -4,13 +4,14 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from loop import GitHub, Loops, State, agent_auth, check_gate, review_gate
+from loop import GitHub, Loops, State, agent_auth, agent_model, check_gate, review_gate, review_marker
 
 
-def review(user='review-bot', state='APPROVED', sha='head', id=1):
-    return {'id': id, 'user': {'login': user}, 'state': state, 'commit_id': sha}
+def review(user='review-bot', state='APPROVED', sha='head', id=1, base='base'):
+    return {'id': id, 'user': {'login': user}, 'state': state, 'commit_id': sha,
+            'body': 'Review findings\n' + review_marker(sha, base)}
 
 
 def check(name='test', conclusion='success', status='completed'):
@@ -18,6 +19,13 @@ def check(name='test', conclusion='success', status='completed'):
 
 
 class Gates(unittest.TestCase):
+    def test_approval_must_cover_current_base_when_merging(self):
+        self.assertTrue(review_gate([review()], 'head', 'review-bot', 'base'))
+        self.assertFalse(review_gate([review()], 'head', 'review-bot', 'new-base'))
+        legacy = review()
+        legacy['body'] = 'Approved before base tracking existed'
+        self.assertFalse(review_gate([legacy], 'head', 'review-bot', 'base'))
+
     def test_requires_explicit_current_approval(self):
         self.assertFalse(review_gate([], 'head', 'review-bot'))
         self.assertFalse(review_gate([review(sha='old')], 'head', 'review-bot'))
@@ -204,11 +212,120 @@ class MergeController(unittest.TestCase):
             self.loops.merge()
         self.loops.gh.request.assert_not_called()
 
+    def test_mergeability_changed_during_checks_blocks_merge(self):
+        changed = dict(self.pr, mergeable_state='blocked')
+        self.loops.gh.request.side_effect = [self.pr, changed]
+        self.loops.merge()
+        self.assertEqual(self.loops.gh.request.call_count, 2)
+
+    def test_old_base_approval_blocks_merge(self):
+        self.loops.snapshot.return_value = ([review(base='old-base')], [check()], [], True, [])
+        self.loops.merge()
+        self.assertEqual(self.loops.gh.request.call_count, 1)
+
     def test_missing_required_checks_configuration_rejected(self):
         self.loops.required = []
         with self.assertRaisesRegex(RuntimeError, 'REQUIRED_CHECKS'):
             self.loops.merge()
         self.loops.gh.request.assert_not_called()
+
+
+class ReviewController(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.loops = object.__new__(Loops)
+        self.loops.state = State(self.root)
+        self.loops.state.link(1, 2)
+        self.loops.repo, self.loops.base, self.loops.reviewer = 'owner/repo', 'main', 'review-bot'
+        self.pr = {'number': 2, 'state': 'open', 'draft': False, 'labels': [],
+                   'user': {'login': 'author'},
+                   'head': {'sha': 'head', 'ref': 'agent/issue-1', 'repo': {'full_name': 'owner/repo'}},
+                   'base': {'sha': 'base', 'ref': 'main'}}
+        self.goal = {'title': 'Fix the bug', 'body': 'Expected behavior', 'unneeded_metadata': 'omit-me'}
+        self.loops.gh = Mock()
+        self.loops.gh.request.side_effect = [self.pr, self.goal, self.pr, {}]
+        self.loops.gh.pages.side_effect = [[], [{'filename': 'new.py', 'previous_filename': 'old.py',
+             'status': 'renamed', 'patch': 'large-patch-' * 10000, 'additions': 1, 'deletions': 1}]]
+        self.loops.workspace = Mock(return_value=(self.root,) * 4)
+        self.loops.git = Mock()
+        self.loops.agent = Mock(return_value={'decision': 'APPROVE', 'summary': 'Looks correct'})
+        self.archive = patch('loop.tarfile.open')
+        self.archive.start()
+
+    def tearDown(self):
+        self.archive.stop()
+        self.loops.state.db.close()
+        self.tmp.cleanup()
+
+    def test_review_reads_source_instead_of_duplicating_patches(self):
+        self.loops.review()
+        prompt = self.loops.agent.call_args.args[2]
+        self.assertIn('new.py', prompt)
+        self.assertIn('old.py', prompt)
+        self.assertIn('Expected behavior', prompt)
+        self.assertNotIn('large-patch', prompt)
+        self.assertNotIn('omit-me', prompt)
+        self.assertTrue(self.loops.agent.call_args.kwargs['review'])
+        payload = self.loops.gh.request.call_args.args[2]
+        self.assertEqual(payload['commit_id'], 'head')
+        self.assertIn(review_marker('head', 'base'), payload['body'])
+
+    def test_current_review_skips_inference(self):
+        self.loops.gh.pages.side_effect = [[review()]]
+        self.loops.review()
+        self.loops.agent.assert_not_called()
+
+    def test_base_change_triggers_new_review(self):
+        self.loops.gh.pages.side_effect = [[review(base='old-base')], []]
+        self.loops.review()
+        self.loops.agent.assert_called_once()
+
+    def test_dismissed_review_triggers_new_review(self):
+        self.loops.gh.pages.side_effect = [[review(), review(state='DISMISSED', id=2)], []]
+        self.loops.review()
+        self.loops.agent.assert_called_once()
+
+    def test_base_change_during_inference_discards_verdict(self):
+        changed = json.loads(json.dumps(self.pr))
+        changed['base']['sha'] = 'new-base'
+        self.loops.gh.request.side_effect = [self.pr, self.goal, changed]
+        self.loops.review()
+        self.assertEqual(self.loops.gh.request.call_count, 3)
+        self.assertTrue(all(call.args[0] != 'pulls/2/reviews'
+                            for call in self.loops.gh.request.call_args_list))
+
+
+class JobMetrics(unittest.TestCase):
+    def test_job_success_failure_and_models_survive_restart_without_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            loops = object.__new__(Loops)
+            loops.state = State(root)
+            loops._agent = Mock(side_effect=['done', RuntimeError('job failed')])
+            with patch.dict(os.environ, {'IMPLEMENT_MODEL': 'coder', 'REVIEW_MODEL': 'critic'}):
+                self.assertEqual(loops.agent(root, root, 'private implementation prompt'), 'done')
+                with self.assertRaisesRegex(RuntimeError, 'job failed'):
+                    loops.agent(root, root, 'private review prompt', review=True)
+            loops.state.db.close()
+            state = State(root)
+            metrics = {row['role']: row for row in state.metrics()}
+            self.assertEqual(metrics['implement']['model'], 'coder')
+            self.assertEqual(metrics['implement']['failures'], 0)
+            self.assertEqual(metrics['review']['model'], 'critic')
+            self.assertEqual(metrics['review']['failures'], 1)
+            self.assertEqual(metrics['review']['avg_prompt_bytes'], len('private review prompt'))
+            self.assertNotIn('private', json.dumps(metrics))
+            state.db.close()
+
+    def test_improvement_can_use_its_own_model_and_falls_back_to_reviewer(self):
+        with patch.dict(os.environ, {'IMPLEMENT_MODEL': 'coder', 'REVIEW_MODEL': 'critic',
+                                     'IMPROVE_MODEL': 'cheap'}):
+            self.assertEqual(agent_model(), 'coder')
+            self.assertEqual(agent_model(review=True), 'critic')
+            self.assertEqual(agent_model(review=True, improve=True), 'cheap')
+            with patch.dict(os.environ, {'IMPROVE_MODEL': ''}):
+                self.assertEqual(agent_model(review=True, improve=True), 'critic')
 
 
 class ImprovementController(unittest.TestCase):
@@ -223,7 +340,7 @@ class ImprovementController(unittest.TestCase):
         self.loops.gh.request.side_effect = [
             {'html_url': 'https://github.com/o/r/pull/2', 'state': 'closed', 'merged': True},
             {'number': 9}]
-        self.loops.snapshot = Mock(return_value=([], [], [], True, []))
+        self.loops.snapshot = Mock(return_value=([review(state='CHANGES_REQUESTED')], [], [], True, []))
         self.loops.workspace = Mock(return_value=(Path(self.tmp.name),) * 4)
         self.loops.agent = Mock(return_value={'needed': True, 'title': 'Add regression test',
                                              'body': 'Evidence: PR #2. Acceptance: reproduce and test.'})
@@ -235,6 +352,17 @@ class ImprovementController(unittest.TestCase):
     def test_no_history_does_not_invent_improvements(self):
         self.loops.improve()
         self.loops.agent.assert_not_called()
+
+    def test_clean_history_does_not_spend_a_model_call(self):
+        self.loops.state.link(1, 2)
+        self.loops.snapshot.return_value = ([review()], [check()], [], True, [])
+        self.loops.improve()
+        self.loops.agent.assert_not_called()
+
+    def test_improvement_receives_recent_job_metrics(self):
+        self.loops.state.link(1, 2)
+        self.loops.improve()
+        self.assertIn('Recent job metrics', self.loops.agent.call_args.args[2])
 
     def test_proposal_once_per_day_and_not_automatically_queued(self):
         self.loops.state.link(1, 2)
