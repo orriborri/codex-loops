@@ -14,6 +14,7 @@ x-common: &common
     AGENT_IMAGE: codex-loops-agent:local
     IMPLEMENT_MODEL: ${IMPLEMENT_MODEL:-}
     REVIEW_MODEL: ${REVIEW_MODEL:-}
+    IMPROVE_MODEL: ${IMPROVE_MODEL:-}
     AUTH_MODE: ${AUTH_MODE:-codex}
     CODEX_AUTH_VOLUME: ${CODEX_AUTH_VOLUME:-codex-loops-auth}
     JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-1800}
@@ -76,10 +77,11 @@ services:
 
   improve:
     <<: *common
+    profiles: [improve]
     command: improve
     environment:
       <<: *environment
-      GH_TOKEN: ${IMPROVE_GITHUB_TOKEN:?Set issue creation/read token}
+      GH_TOKEN: ${IMPROVE_GITHUB_TOKEN:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       POLL_SECONDS: 600
       AUTO_QUEUE_IMPROVEMENTS: ${AUTO_QUEUE_IMPROVEMENTS:-false}
