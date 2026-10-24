@@ -93,10 +93,44 @@ def review_marker(sha, base_sha):
     return f'<!-- codex-review:{sha}:{base_sha} -->'
 
 
+def label_names(item):
+    return {label['name'] for label in item.get('labels', [])}
+
+
 def agent_model(review=False, improve=False):
     if improve:
         return os.getenv('IMPROVE_MODEL', '') or os.getenv('REVIEW_MODEL', '')
     return os.getenv('REVIEW_MODEL' if review else 'IMPLEMENT_MODEL', '')
+
+
+def agent_schema(review=False, improve=False):
+    """One output contract drives both the CLI schema and local validation."""
+    fields = {'outcome': ['completed', 'needs_clarification', 'needs_human_decision'], 'summary': str}
+    if review:
+        fields = {'decision': ['APPROVE', 'REQUEST_CHANGES'], 'summary': str}
+    if improve:
+        fields = {'needed': bool, 'title': str, 'body': str}
+    properties = {}
+    for name, allowed in fields.items():
+        properties[name] = {'type': 'boolean' if allowed is bool else 'string'}
+        if isinstance(allowed, list):
+            properties[name]['enum'] = allowed
+    return {'type': 'object', 'additionalProperties': False,
+            'properties': properties, 'required': list(fields)}
+
+
+def parse_agent_output(text, schema):
+    data = json.loads(text)
+    properties = schema['properties']
+    if not isinstance(data, dict) or data.keys() != properties.keys():
+        raise ValueError('Invalid agent output fields')
+    for name, rule in properties.items():
+        expected = bool if rule['type'] == 'boolean' else str
+        if type(data[name]) is not expected or ('enum' in rule and data[name] not in rule['enum']):
+            raise ValueError('Invalid agent output value')
+    if 'summary' in data and not data['summary'].strip():
+        raise ValueError('Empty agent summary')
+    return data
 
 
 def review_gate(reviews, sha, reviewer, base_sha=None):
@@ -153,9 +187,12 @@ class State:
         return [dict(zip(('role', 'model', 'jobs', 'failures', 'avg_prompt_bytes',
                           'avg_duration_seconds'), row)) for row in rows]
 
-    def claim(self, key, limit):
+    def attempts(self, key):
         row = self.db.execute('SELECT count FROM attempts WHERE key=?', (key,)).fetchone()
-        count = row[0] if row else 0
+        return row[0] if row else 0
+
+    def claim(self, key, limit):
+        count = self.attempts(key)
         if count >= limit:
             LOG.warning('Retry limit reached: %s', key)
             return False
@@ -208,8 +245,7 @@ class Loops:
         if task is None:
             return
         issue, pr, key, limit = task
-        count = self.state.db.execute('SELECT count FROM attempts WHERE key=?', (key,)).fetchone()
-        exhausted = bool(count and count[0] >= limit)
+        exhausted = self.state.attempts(key) >= limit
         self.progress(issue, pr, 'retry_exhausted' if exhausted else 'retry_pending',
                       'The controller job failed; diagnostic output is retained on the runner.',
                       'maintainer' if exhausted else ('review' if key.startswith('review:') else 'implement'),
@@ -223,7 +259,7 @@ class Loops:
     def check_resume(self, issue, pr, goal, pull=None):
         requested = False
         for target, data in [(issue, goal)] + ([(pr, pull)] if pull else []):
-            if any(label['name'] == 'agent:resume' for label in data.get('labels', [])):
+            if 'agent:resume' in label_names(data):
                 self.gh.request(f'issues/{target}/labels/agent%3Aresume', 'DELETE')
                 requested = True
         if requested:
@@ -246,36 +282,39 @@ class Loops:
         number = pr['number']
         context = pr['head']['sha'] + ':' + pr['base']['sha']
         decisions = latest_reviews(reviews)
+        approved = review_gate(reviews, pr['head']['sha'], self.reviewer, pr['base']['sha'])
+        attempts = self.state.attempts(f"review:{number}:{pr['head']['sha']}:{pr['base']['sha']}")
         old_requests = [r for r in decisions.values() if r['state'] == 'CHANGES_REQUESTED'
                         and r.get('commit_id') != pr['head']['sha']]
         if old_requests:
-            self.progress(issue, number, 'needs_human_decision',
+            status = ('needs_human_decision',
                           'A change request on an older revision still blocks merging.', 'maintainer',
-                          'Ask that reviewer to approve, or have an authorized maintainer dismiss the review.', context)
+                          'Ask that reviewer to approve, or have an authorized maintainer dismiss the review.')
         elif failed:
-            self.progress(issue, number, 'ci_failed', 'Completed CI checks report a failure.',
-                          'implement', 'Inspect diagnostics and attempt a bounded repair; infrastructure failures may need a maintainer.', context)
+            status = ('ci_failed', 'Completed CI checks report a failure.',
+                      'implement', 'Inspect diagnostics and attempt a bounded repair; infrastructure failures may need a maintainer.')
         elif any(r['state'] == 'CHANGES_REQUESTED' for r in decisions.values()):
-            self.progress(issue, number, 'changes_requested', 'Review requested changes on the current revision.',
-                          'implement', 'Address the findings or explicitly request a human decision.', context)
-        elif (not review_gate(reviews, pr['head']['sha'], self.reviewer, pr['base']['sha'])
-              and self.state.db.execute('SELECT 1 FROM attempts WHERE key=? AND count>=3',
-                  (f"review:{number}:{pr['head']['sha']}:{pr['base']['sha']}",)).fetchone()):
-            self.progress(issue, number, 'retry_exhausted', 'The bounded attempt limit was reached.',
-                          'maintainer', 'Inspect runner logs, resolve the cause, then add agent:resume.')
+            status = ('changes_requested', 'Review requested changes on the current revision.',
+                      'implement', 'Address the findings or explicitly request a human decision.')
+        elif not approved and attempts >= 3:
+            # Match claim_work's exhausted observation, including its empty context.
+            context = ''
+            status = ('retry_exhausted', 'The bounded attempt limit was reached.',
+                      'maintainer', 'Inspect runner logs, resolve the cause, then add agent:resume.')
         elif not green:
-            self.progress(issue, number, 'waiting_for_ci', 'Required checks are missing, pending or not successful.',
-                          'ci', 'Wait for CI; inspect missing or stuck checks if the wait persists.', context)
-        elif not review_gate(reviews, pr['head']['sha'], self.reviewer, pr['base']['sha']):
-            self.progress(issue, number, 'waiting_for_review', 'A current head/base approval is required.',
-                          'review', 'Review the current revision independently.', context)
+            status = ('waiting_for_ci', 'Required checks are missing, pending or not successful.',
+                      'ci', 'Wait for CI; inspect missing or stuck checks if the wait persists.')
+        elif not approved:
+            status = ('waiting_for_review', 'A current head/base approval is required.',
+                      'review', 'Review the current revision independently.')
         elif pr.get('mergeable') is not True or pr.get('mergeable_state') != 'clean':
-            self.progress(issue, number, 'waiting_for_mergeability', 'GitHub has not reported clean mergeability.',
-                          'maintainer', 'Inspect branch requirements, conflicts and GitHub mergeability.', context)
+            status = ('waiting_for_mergeability', 'GitHub has not reported clean mergeability.',
+                      'maintainer', 'Inspect branch requirements, conflicts and GitHub mergeability.')
         else:
-            self.progress(issue, number, 'ready_to_merge', 'CI and the current review satisfy local gates.',
-                          'merge' if os.getenv('AUTO_MERGE', 'false').lower() == 'true' else 'maintainer',
-                          'Merge after server-side branch requirements pass.', context)
+            status = ('ready_to_merge', 'CI and the current review satisfy local gates.',
+                      'merge' if os.getenv('AUTO_MERGE', 'false').lower() == 'true' else 'maintainer',
+                      'Merge after server-side branch requirements pass.')
+        self.progress(issue, number, *status, context)
 
     def snapshot(self, pr):
         sha = pr['head']['sha']
@@ -286,8 +325,7 @@ class Loops:
         return reviews, checks, statuses, green, failed
 
     def valid(self, pr):
-        labels = {label['name'] for label in pr.get('labels', [])}
-        return (pr['state'] == 'open' and not pr['draft'] and 'agent:paused' not in labels
+        return (pr['state'] == 'open' and not pr['draft'] and 'agent:paused' not in label_names(pr)
                 and pr['head']['repo'] is not None
                 and pr['head']['repo']['full_name'].lower() == self.repo.lower()
                 and pr['base']['ref'] == self.base
@@ -328,19 +366,7 @@ class Loops:
                      len(prompt.encode('utf-8')), time.monotonic() - started, outcome))
 
     def _agent(self, source, output, prompt, review=False, improve=False, baseline=None):
-        schema = {'type': 'object', 'additionalProperties': False,
-                  'properties': {'decision': {'type': 'string', 'enum': ['APPROVE', 'REQUEST_CHANGES']},
-                                 'summary': {'type': 'string'}}, 'required': ['decision', 'summary']}
-        if not review:
-            schema = {'type': 'object', 'additionalProperties': False,
-                      'properties': {'outcome': {'type': 'string', 'enum': [
-                          'completed', 'needs_clarification', 'needs_human_decision']},
-                          'summary': {'type': 'string'}}, 'required': ['outcome', 'summary']}
-        if improve:
-            schema = {'type': 'object', 'additionalProperties': False,
-                      'properties': {'needed': {'type': 'boolean'}, 'title': {'type': 'string'},
-                                     'body': {'type': 'string'}},
-                      'required': ['needed', 'title', 'body']}
+        schema = agent_schema(review, improve)
         (output / 'schema.json').write_text(json.dumps(schema))
         auth_args, job_env = agent_auth()
         name = 'codex-job-' + uuid.uuid4().hex
@@ -374,23 +400,7 @@ class Loops:
         finally:
             subprocess.run(['docker', 'rm', '-f', name], stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL, timeout=30)
-        result = (output / 'result.json').read_text()
-        if improve:
-            data = json.loads(result)
-            if set(data) != {'needed', 'title', 'body'} or type(data['needed']) is not bool or not all(isinstance(data[k], str) for k in ('title', 'body')):
-                raise ValueError('Invalid improvement output')
-            return data
-        if review:
-            data = json.loads(result)
-            if set(data) != {'decision', 'summary'} or data['decision'] not in ('APPROVE', 'REQUEST_CHANGES') or not isinstance(data['summary'], str) or not data['summary'].strip():
-                raise ValueError('Invalid reviewer output')
-            return data
-        data = json.loads(result)
-        if (set(data) != {'outcome', 'summary'} or data['outcome'] not in (
-                'completed', 'needs_clarification', 'needs_human_decision')
-                or not isinstance(data['summary'], str) or not data['summary'].strip()):
-            raise ValueError('Invalid implementation output')
-        return data
+        return parse_agent_output((output / 'result.json').read_text(), schema)
 
     def publish(self, control, source, branch, expected=None):
         # Only trusted controller owns git metadata; Codex sees source files only.
@@ -428,7 +438,7 @@ class Loops:
     def _implement(self):
         for issue, in self.state.db.execute('SELECT issue FROM workflow WHERE pr IS NULL').fetchall():
             goal = self.gh.request(f'issues/{issue}')
-            labels = {x['name'] for x in goal.get('labels', [])}
+            labels = label_names(goal)
             if goal['state'] == 'closed':
                 self.progress(issue, None, 'closed', 'The goal issue was closed before a PR was created.',
                               'maintainer', 'Reopen and queue the goal if further work is needed.')
@@ -445,7 +455,7 @@ class Loops:
                               'The PR was merged.' if merged else 'The PR was closed without merging.',
                               'maintainer', 'Track deployment separately.' if merged else 'Decide whether further work is needed.')
                 continue
-            if any(x['name'] == 'agent:paused' for x in pr.get('labels', [])):
+            if 'agent:paused' in label_names(pr):
                 self.progress(issue, number, 'paused', 'The PR has agent:paused.',
                               'maintainer', 'Remove agent:paused to continue.')
                 continue
@@ -454,7 +464,7 @@ class Loops:
                               'maintainer', 'Restore an eligible PR before continuing.')
                 continue
             goal = self.gh.request(f'issues/{issue}')
-            if goal['state'] != 'open' or any(x['name'] == 'agent:paused' for x in goal.get('labels', [])):
+            if goal['state'] != 'open' or 'agent:paused' in label_names(goal):
                 self.progress(issue, number, 'paused', 'The source issue is closed or paused.',
                               'maintainer', 'Reopen the source issue or remove agent:paused to continue.')
                 continue
@@ -517,7 +527,7 @@ class Loops:
             n = issue['number']
             if self.state.db.execute('SELECT 1 FROM jobs WHERE issue=?', (n,)).fetchone():
                 continue
-            if any(x['name'] == 'agent:paused' for x in issue['labels']):
+            if 'agent:paused' in label_names(issue):
                 self.progress(n, None, 'paused', 'The goal is no longer queued or is explicitly paused.',
                               'maintainer', 'Restore agent:ready and remove agent:paused to continue.')
                 continue
@@ -545,7 +555,7 @@ class Loops:
                     return
                 # Recheck authorization after potentially long-running work.
                 fresh = self.gh.request(f'issues/{n}')
-                labels = {x['name'] for x in fresh['labels']}
+                labels = label_names(fresh)
                 if fresh['state'] != 'open' or 'agent:ready' not in labels or 'agent:paused' in labels:
                     self.progress(n, None, 'paused', 'The source issue is no longer authorized for implementation.',
                                   'maintainer', 'Reopen the issue and restore agent:ready when appropriate.')
@@ -665,9 +675,8 @@ class Loops:
                 'ci_green': green, 'failed_checks': failed,
                 'workflow_history': self.state.workflow.history(issue, 20),
                 'observed_state_seconds': self.state.workflow.durations(issue),
-                'fix_attempts': self.state.db.execute('SELECT count FROM attempts WHERE key=?',
-                    (f'fix:{number}',)).fetchone()})
-        signals = any(item['failed_checks'] or (item['fix_attempts'] or (0,))[0]
+                'fix_attempts': self.state.attempts(f'fix:{number}')})
+        signals = any(item['failed_checks'] or item['fix_attempts']
                       or any(r['state'] == 'CHANGES_REQUESTED' for r in item['reviews'])
                       for item in evidence)
         if not signals or not self.state.claim(f'improve:{day}', 3):

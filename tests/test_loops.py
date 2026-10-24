@@ -6,7 +6,8 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from loop import GitHub, Loops, State, agent_auth, agent_model, check_gate, review_gate, review_marker
+from loop import (GitHub, Loops, State, agent_auth, agent_model, agent_schema,
+                  check_gate, parse_agent_output, review_gate, review_marker)
 
 
 def review(user='review-bot', state='APPROVED', sha='head', id=1, base='base'):
@@ -109,6 +110,29 @@ class Gates(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(RuntimeError, 'Protected'):
                 loops.publish(Path(directory), Path(directory), 'agent/issue-1')
+
+
+class AgentOutputs(unittest.TestCase):
+    def test_all_job_roles_use_closed_typed_output_contracts(self):
+        cases = [({}, {'outcome': 'completed', 'summary': 'Tested'}),
+                 ({'review': True}, {'decision': 'APPROVE', 'summary': 'Reviewed'}),
+                 ({'review': True, 'improve': True}, {'needed': False, 'title': '', 'body': ''})]
+        for options, data in cases:
+            with self.subTest(options=options):
+                schema = agent_schema(**options)
+                self.assertEqual(parse_agent_output(json.dumps(data), schema), data)
+                for invalid in [dict(data, extra=True), {}, [], None]:
+                    with self.assertRaises(ValueError):
+                        parse_agent_output(json.dumps(invalid), schema)
+
+    def test_invalid_decisions_types_and_empty_summaries_are_rejected(self):
+        cases = [({}, {'outcome': 'bypass', 'summary': 'Tested'}),
+                 ({'review': True}, {'decision': 'APPROVE', 'summary': '  '}),
+                 ({'review': True}, {'decision': 'APPROVE', 'summary': 1}),
+                 ({'improve': True}, {'needed': 1, 'title': '', 'body': ''})]
+        for options, data in cases:
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                parse_agent_output(json.dumps(data), agent_schema(**options))
 
 
 class Authentication(unittest.TestCase):
