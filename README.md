@@ -47,6 +47,7 @@ The labels can be created with GitHub's web UI or GitHub CLI:
 ```sh
 gh label create agent:ready --repo OWNER/REPO --color 0E8A16
 gh label create agent:paused --repo OWNER/REPO --color B60205
+gh label create agent:resume --repo OWNER/REPO --color 0E8A16
 gh label create agent:proposal --repo OWNER/REPO --color D4C5F9
 gh label create agent:improvement --repo OWNER/REPO --color 1D76DB
 ```
@@ -85,7 +86,7 @@ Scope tokens to only the target repository. All need metadata read; additional p
 
 | Variable | Repository permissions |
 | --- | --- |
-| `IMPLEMENT_GITHUB_TOKEN` | Contents write, Pull requests write, Issues read, Checks read, Commit statuses read |
+| `IMPLEMENT_GITHUB_TOKEN` | Contents write, Pull requests write, Issues write, Checks read, Commit statuses read |
 | `REVIEW_GITHUB_TOKEN` | Contents read, Pull requests write, Issues read |
 | `MERGE_GITHUB_TOKEN` | Contents write, Pull requests write, Issues read, Checks read, Commit statuses read |
 | `IMPROVE_GITHUB_TOKEN` | Contents read, Pull requests read, Issues write, Checks read, Commit statuses read |
@@ -102,6 +103,47 @@ Configure and enforce server-side rules for the base branch before enabling merg
 These rules are essential: the GitHub merge endpoint can bind to the head SHA, but reads of reviews, CI and base branch are separate API calls. Server-side enforcement closes the intervening race. The runner does not automatically provision or audit branch protection.
 
 The local merge gate requires the configured bot's approval on the current head and base SHA pair, no latest `CHANGES_REQUESTED` decision from any reviewer, all configured check names present and successful, every other observed check/status also successful, and clean mergeability. Reviews include a controller-generated `codex-review` marker identifying that pair. Base changes invalidate review, even if the PR head did not change; pre-upgrade reviews without the marker must be renewed. Missing, queued, skipped, neutral, unknown or failing checks block merges. If the same name appears in multiple check sources, every occurrence must pass. A human change request on an older commit continues to block until that person approves or an authorized maintainer dismisses it. Comments alone never clear a change request.
+
+## Workflow state and visible progress
+
+`workflow.py` and the controllers in this repository own the state definitions, transitions, retries and escalation rules. The target repository supplies goals, acceptance criteria, project instructions and CI. The runner's SQLite database stores current workflow state and append-only transition history. No workflow source files are copied into target repositories.
+
+Each observed transition records the goal issue, optional PR, state, reason, next owner, next action, revision context where available, and UTC timestamp. Repeated identical observations preserve the original timestamp instead of adding duplicate events. The implementation controller maintains one progress comment on the goal issue and, once created, one on the work PR. It edits those comments as progress changes. This requires **Issues write** on the implementation token, including when upgrading an existing runner. Review and merge identities only update local state; the implementation service publishes those updates on its next poll. Model-job containers still have no GitHub credentials.
+
+| State | Meaning / next owner |
+| --- | --- |
+| `queued` | Explicitly resumed; implementation will re-evaluate current conditions |
+| `implementing`, `repair_pending`, `repairing` | Implementation owns the active or upcoming work |
+| `waiting_for_ci` | Required checks are missing, pending or not successful; CI or a maintainer must investigate |
+| `ci_failed` | Completed checks failed; diagnostics need investigation |
+| `waiting_for_review`, `reviewing` | The independent reviewer owns the next step |
+| `changes_requested` | Implementation must address findings or ask for a human decision |
+| `needs_clarification` | A maintainer must answer specific missing requirements |
+| `needs_human_decision` | A maintainer must resolve a disputed finding, operational blocker or outstanding older change request |
+| `retry_pending`, `retry_exhausted` | A bounded attempt failed; the controller retries, or a maintainer must intervene once exhausted |
+| `paused` | Work is explicitly paused or no longer eligible |
+| `waiting_for_mergeability`, `ready_to_merge` | GitHub requirements must be checked; the merge service or a maintainer owns the next action |
+| `merged`, `closed` | Terminal PR outcome; deployment is tracked separately |
+
+Implementation and repair jobs return structured outcomes: `completed`, `needs_clarification`, or `needs_human_decision`. A stopping outcome never publishes the job's partial source changes. A clarification hold resumes when the source issue's title/body changes; comments and timestamp changes alone do not resume it. A human-decision hold requires an explicit resume. Both types block further repair, independent review and automatic merging until cleared.
+
+To resume a hold or exhausted attempt cycle, add **`agent:resume`** to the source issue or work PR. The implementation controller consumes the label and resets only that goal's implementation, repair and review attempt counters and repair fingerprints. The source issue must remain eligible (`agent:ready` before initial implementation); remove `agent:paused` separately. Resuming does not approve anything or bypass CI, reviews, revision freshness or branch protection. For an older human change request, the original reviewer must still approve or an authorized maintainer must dismiss it.
+
+Comment updates are retried after API failures and do not interrupt implementation. A marker persisted before comment creation lets the runner recover a successful POST whose response was lost, rather than creating another comment. Updating the same state does not publish another comment. Review progress may remain at `waiting_for_review` during a job because the single-host lock serializes controllers; local history still records the review interval.
+
+To inspect a goal's history and observed wall time by state, run from a checkout on the runner (adjust the path and issue number):
+
+```python
+from pathlib import Path
+from loop import State
+
+state = State(Path('/opt/codex-loops/work'))
+print(state.workflow.history(123))
+print(state.workflow.durations(123))
+state.db.close()
+```
+
+Durations reflect controller observations and polling, including time waiting between handoffs; they are not exact CI execution timings. Terminal states do not keep accumulating delivery time. Recent PR evidence sent to self-improvement includes transition history and state durations alongside model-job metrics. These observations can identify whether the actual bottleneck is coding, CI, review or a human decision before adding more automation.
 
 ## Self improvement
 
@@ -139,7 +181,7 @@ python3 -m py_compile loop.py
 docker compose config --quiet
 ```
 
-The automated suite exercises review/check gates, pagination, durable attempt limits, merge controller decisions, SHA race rejection, and real local Git publication. Docker builds, Codex inference and GitHub side effects need a configured integration trial on the runner. No tokens or live repository mutations are included in the package.
+The automated suite exercises review/check gates, pagination, durable attempt limits, merge controller decisions, SHA race rejection, real local Git publication, persisted workflow history and durations, clarification/human-decision holds, explicit resume, structured implementation output, progress-comment recovery, and failure isolation. Docker builds, Codex inference and GitHub side effects need a configured integration trial on the runner. No tokens or live repository mutations are included in the test suite.
 
 Official references:
 

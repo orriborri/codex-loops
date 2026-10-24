@@ -3,4 +3,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends git docker.io c
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY loop.py /app/loop.py
+COPY workflow.py /app/workflow.py
 ENTRYPOINT ["python", "-u", "/app/loop.py"]
