@@ -103,16 +103,22 @@ class Workflow:
         failure = None
         for issue, pr, state, reason, owner, action, context, since in self.db.execute(
                 'SELECT * FROM workflow').fetchall():
+            progress = ('### Codex loop progress\n\n'
+                        f'**State:** `{state}`\n\n**Reason:** {reason}\n\n'
+                        f'**Next owner:** {owner}\n\n**Next action:** {action}\n\n'
+                        f'Goal: #{issue}' + (f' · PR: #{pr}' if pr else '') +
+                        f'\n\nObserved since: {since}' + (f'\n\nRevision: `{context}`' if context else '') +
+                        '\n\nMerging does not imply deployment. Workflow history is retained by the runner.')
             for target in dict.fromkeys([issue] + ([pr] if pr else [])):
                 try:
-                    self._sync_comment(gh, target, issue, pr, state, reason, owner, action, context, since)
+                    self._sync_comment(gh, target, progress)
                 except Exception as exc:
                     # One inaccessible issue must not starve progress on other work.
                     failure = exc
         if failure is not None:
             raise failure
 
-    def _sync_comment(self, gh, target, issue, pr, state, reason, owner, action, context, since):
+    def _sync_comment(self, gh, target, progress):
         row = self.db.execute('SELECT marker,comment_id,body FROM progress_comments WHERE target=?',
                               (target,)).fetchone()
         if row is None:
@@ -121,12 +127,7 @@ class Workflow:
             with self.db:
                 self.db.execute('INSERT INTO progress_comments VALUES (?,?,NULL,NULL)', (target, row[0]))
         marker, comment_id, published = row
-        body = (f'{marker}\n### Codex loop progress\n\n'
-                f'**State:** `{state}`\n\n**Reason:** {reason}\n\n'
-                f'**Next owner:** {owner}\n\n**Next action:** {action}\n\n'
-                f'Goal: #{issue}' + (f' · PR: #{pr}' if pr else '') +
-                f'\n\nObserved since: {since}' + (f'\n\nRevision: `{context}`' if context else '') +
-                '\n\nMerging does not imply deployment. Workflow history is retained by the runner.')
+        body = marker + '\n' + progress
         if body == published:
             return
         if comment_id is None:
