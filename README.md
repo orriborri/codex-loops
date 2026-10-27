@@ -78,6 +78,36 @@ docker compose --profile auth run --rm login login --device-auth
 
 Keep the volume between restarts; `docker compose down -v` deletes the saved login. Protect volume backups as credentials. Do not run another stack or desktop CLI concurrently against this credential cache; use a distinct dedicated login/volume per runner. GitHub tokens are still required separately. Official OpenAI guidance recommends API keys as the default for programmatic CI/CD; saved account auth is an advanced option for trusted runners.
 
+## Optional Opik tracing and outcome tracking
+
+The controllers can export metadata-only traces to a self-hosted Opik instance or Opik Cloud. This is optional and disabled by default; no Opik service or SDK is required to run the loops.
+
+Configure `.env` after you have an Opik endpoint reachable from the controller containers:
+
+```dotenv
+OPIK_ENABLED=true
+OPIK_URL_OVERRIDE=http://opik.your-lan:5173/api
+OPIK_PROJECT_NAME=codex-loops
+```
+
+For Opik Cloud use `OPIK_URL_OVERRIDE=https://www.comet.com/opik/api`, plus your `OPIK_API_KEY` and `OPIK_WORKSPACE`. Keep credentials in your local `.env`. Rebuild and recreate the controllers (`docker compose up -d --build implement review merge`); recreate the optional `improve` service too if enabled. An address such as `localhost:5173` inside a controller refers to that container, not the Docker host. This change connects to Opik; it does not deploy the Opik server.
+
+Each model job emits a trace containing its role, configured model (or `<cli-default>`), duration, prompt byte count and SHA-256 hash, execution outcome, and validated decision/outcome enums. The controller source fingerprint identifies the implementation and its embedded prompts; the full prompt hash is task-specific, not a standalone prompt-template version. Jobs with an active issue/PR include their issue, PR and bounded attempt number. Current head/base SHAs are included when the workflow observation provides them.
+
+Workflow changes emit separate traces, including CI failure, waiting for review, ready to merge, retry exhaustion, merged, and closed. Job and workflow traces share a thread per repository/issue, so repair/review rounds can be inspected together. Polls that observe the same state do not create duplicates. Improvement jobs are repository-wide rather than tied to one issue.
+
+Numeric feedback scores distinguish execution success, the implementer's reported completion, the model review verdict, observed CI readiness/failure and confirmed merge/closure. A model's successful execution is not evidence that tests passed. A model approval is not a GitHub approval: the existing controllers still submit and verify the actual review. Merging is not deployment or proof that a change has no defects. No tokens, monetary costs or test pass counts are invented from prompt size or wall time.
+
+Raw prompts, issue titles/bodies, source code, summaries, review findings, CI logs, exception messages and credential values are **not exported**. Free-text reasons and next actions remain on the runner/GitHub. Opik configuration and keys stay in controllers; job containers receive no Opik settings. Disable export with `OPIK_ENABLED=false` and recreate controllers.
+
+A SQLite outbox in the existing runner database preserves pending exports across restarts. Each iteration attempts at most 50 traces, then their numeric scores, using `OPIK_TIMEOUT_SECONDS` per HTTP request (default 2, capped at 10). Unavailable endpoints, authentication errors or invalid configuration do not change job results or GitHub merge gates. Failed exports keep stable UUIDv7 IDs for retry; a lost acknowledgement can resend an existing trace/score. Export is best-effort, not exactly-once delivery. Redirects are rejected rather than forwarding credentials or traces to another URL.
+
+The queue holds at most `OPIK_MAX_PENDING` pending traces (default 10,000). When full, new telemetry is dropped with a warning so runner disk usage cannot grow indefinitely from Opik alone. Enabled workflow history is collected in bounded batches; existing history from before first enablement is not backfilled. A slow endpoint can add up to two HTTP timeouts to a poll. A hard crash during a model job may leave that job without a completed trace. Pending rows retain their original project name, but delivery uses the currently configured endpoint/workspace: drain or clear the pending queue before switching destinations. Disabled tracing retains pending rows without transmitting them.
+
+This first integration provides measurements and failure examples. It does not add automatic prompt optimization or benchmark replay. Those require curated tasks, independent acceptance tests, and held-out comparisons before proposing prompt changes through normal PR review.
+
+API references: [trace batch ingestion](https://www.comet.com/docs/opik/reference/rest-api/traces/create-traces), [trace feedback scores](https://www.comet.com/docs/opik/reference/rest-api/traces/score-batch-of-traces), and [REST configuration](https://www.comet.com/docs/opik/reference/rest-api/overview).
+
 ## GitHub identities and permissions
 
 The PR author and reviewer **must be distinct GitHub identities**. Separate PATs belonging to the same person are not distinct identities. Prefer dedicated bots or GitHub Apps; short-lived App tokens need an external refresh/restart mechanism because this starter reads static tokens from environment variables.

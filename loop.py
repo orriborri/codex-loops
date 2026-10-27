@@ -1,6 +1,7 @@
 """One implementation loop, independent review, deterministic merge, optional learning."""
 import base64
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -18,8 +19,10 @@ import urllib.parse
 import urllib.request
 import uuid
 from workflow import Workflow
+from telemetry import Telemetry
 
 LOG = logging.getLogger('loops')
+CONTROLLER_VERSION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
 
 
 def run(args, cwd=None, env=None, timeout=300, input=None):
@@ -177,6 +180,7 @@ class State:
             duration_seconds REAL, outcome TEXT)''')
         self.db.commit()
         self.workflow = Workflow(self.db)
+        self.telemetry = Telemetry(self.db)
 
     def metrics(self):
         """Bounded recent history; no prompts, source, output or credentials stored here."""
@@ -265,10 +269,10 @@ class Loops:
         if requested:
             self.state.workflow.resume(issue, pr)
 
-    def run_work(self, issue, pr, source, output, prompt, goal):
+    def run_work(self, issue, pr, source, output, prompt, goal, revision=''):
         self.progress(issue, pr, 'repairing' if pr else 'implementing',
                       'The implementation agent is working on the current goal.',
-                      'implement', 'Wait for the bounded model job to finish.')
+                      'implement', 'Wait for the bounded model job to finish.', revision)
         self.sync_progress()
         result = self.agent(source, output, prompt)
         if result['outcome'] != 'completed':
@@ -353,7 +357,8 @@ class Loops:
 
     def agent(self, source, output, prompt, review=False, improve=False, baseline=None):
         role = 'improve' if improve else 'review' if review else 'implement'
-        started, outcome = time.monotonic(), 'failed'
+        started, wall_started, outcome = time.monotonic(), time.time(), 'failed'
+        result = None
         try:
             result = self._agent(source, output, prompt, review, improve, baseline)
             outcome = 'success'
@@ -364,6 +369,11 @@ class Loops:
                     (role, model, prompt_bytes, duration_seconds, outcome) VALUES (?,?,?,?,?)''',
                     (role, agent_model(review, improve) or '<cli-default>',
                      len(prompt.encode('utf-8')), time.monotonic() - started, outcome))
+            self.state.telemetry.job(
+                getattr(self, 'repo', os.getenv('GITHUB_REPOSITORY', 'unknown')), role,
+                agent_model(review, improve) or '<cli-default>', prompt, wall_started,
+                time.monotonic() - started, outcome, result,
+                getattr(self, 'active_task', None), CONTROLLER_VERSION)
 
     def _agent(self, source, output, prompt, review=False, improve=False, baseline=None):
         schema = agent_schema(review, improve)
@@ -486,7 +496,8 @@ class Loops:
             if failed or changes:
                 self.observe_pr(issue, pr, reviews, green, failed)
             self.progress(issue, number, 'repair_pending', 'Current review, CI or merge conflicts require repair.',
-                          'implement', 'Investigate diagnostics and address the current findings.')
+                          'implement', 'Investigate diagnostics and address the current findings.',
+                          pr['head']['sha'] + ':' + pr['base']['sha'])
             comments = self.gh.pages(f'pulls/{number}/comments')
             # Include check annotations (test errors) and CI links for diagnosis.
             annotations = []
@@ -509,7 +520,8 @@ class Loops:
                 self.prompt(goal) + '\nFix review/CI failures and merge conflicts. '
                 'Add appropriate tests. Do not change CI policy. Diagnostics:\n' + json.dumps({
                     'reviews': changes, 'inline_comments': comments, 'failed_checks': failed,
-                    'annotations': annotations, 'merge_conflict': conflict}), goal):
+                    'annotations': annotations, 'merge_conflict': conflict}), goal,
+                revision=pr['head']['sha'] + ':' + pr['base']['sha']):
                 return
             current = self.gh.request(f'pulls/{number}')
             if not self.valid(current) or current['head']['sha'] != pr['head']['sha']:
@@ -756,6 +768,7 @@ def main():
                 try:
                     getattr(loops, role)()
                 finally:
+                    loops.state.telemetry.flush(loops.repo)
                     loops.state.db.close()
             except BlockingIOError:
                 pass
