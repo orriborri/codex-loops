@@ -5,6 +5,8 @@ import subprocess
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
+from support import goal as goal_fixture, verdict as verdict_fixture
+from reviewing import goal_contract, ChangeTooLarge
 
 from loop import (GitHub, Loops, State, agent_auth, agent_model, agent_schema,
                   check_gate, parse_agent_output, review_gate, review_marker)
@@ -104,6 +106,27 @@ class Gates(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 loops.publish(control, source, 'agent/issue-1')
 
+    def test_repair_budget_counts_cumulative_application_diff_against_base(self):
+        with tempfile.TemporaryDirectory() as directory:
+            control, source = Path(directory) / 'control', Path(directory) / 'source'
+            control.mkdir(); source.mkdir()
+            def git(*args):
+                return subprocess.check_output(['git', *args], cwd=control, text=True, stderr=subprocess.DEVNULL).strip()
+            git('init')
+            (control / 'app.py').write_text('')
+            git('add', '.')
+            git('-c', 'user.name=T', '-c', 'user.email=t@x', 'commit', '-m', 'base')
+            base = git('rev-parse', 'HEAD')
+            (control / 'app.py').write_text('line\n' * 200)
+            git('add', '.')
+            git('-c', 'user.name=T', '-c', 'user.email=t@x', 'commit', '-m', 'initial work')
+            (source / 'app.py').write_text('line\n' * 301)
+            loops = object.__new__(Loops)
+            with patch.dict(os.environ, {'MAX_CHANGE_LINES': '300'}):
+                with self.assertRaisesRegex(ChangeTooLarge, '301 application lines'):
+                    loops.publish(control, source, 'agent/issue-1', base_revision=base)
+            self.assertEqual(len(git('log', '--oneline').splitlines()), 2)
+
     def test_protected_workflow_cannot_be_published(self):
         loops = object.__new__(Loops)
         loops.git = lambda *args, **kwargs: '.github/workflows/ci.yml' if 'diff' in args else ''
@@ -114,8 +137,8 @@ class Gates(unittest.TestCase):
 
 class AgentOutputs(unittest.TestCase):
     def test_all_job_roles_use_closed_typed_output_contracts(self):
-        cases = [({}, {'outcome': 'completed', 'summary': 'Tested'}),
-                 ({'review': True}, {'decision': 'APPROVE', 'summary': 'Reviewed'}),
+        cases = [({}, {'outcome': 'completed', 'summary': 'Tested', 'finding_responses': []}),
+                 ({'review': True}, verdict_fixture()),
                  ({'review': True, 'improve': True}, {'needed': False, 'title': '', 'body': ''})]
         for options, data in cases:
             with self.subTest(options=options):
@@ -189,7 +212,17 @@ class MergeController(unittest.TestCase):
                    'base': {'sha': 'base', 'ref': 'main'}, 'mergeable': True, 'mergeable_state': 'clean'}
         from unittest.mock import Mock
         self.loops.gh = Mock()
-        self.loops.gh.request.side_effect = [self.pr, self.pr, {'merged': True}]
+        self.goal = goal_fixture()
+        report = self.loops.state.reviews.record(1, 2, 'head', 'base', goal_contract(self.goal), verdict_fixture(), [])
+        self.loops.state.reviews.published(report['id'], 1)
+        self.pulls = [self.pr, self.pr]
+        def request(path, method='GET', data=None):
+            if path == 'pulls/2': return self.pulls.pop(0)
+            if path == 'issues/1': return self.goal
+            if path == 'pulls/2/merge': return {'merged': True}
+            raise AssertionError(path)
+        self.loops.gh.request.side_effect = request
+        self.loops.gh.pages.return_value = []
         self.loops.snapshot = Mock(return_value=([review()], [check()], [], True, []))
         self.env = patch.dict(os.environ, {'AUTO_MERGE': 'true'})
         self.env.start()
@@ -206,16 +239,16 @@ class MergeController(unittest.TestCase):
     def test_new_head_during_checks_blocks_merge(self):
         changed = json.loads(json.dumps(self.pr))
         changed['head']['sha'] = 'new'
-        self.loops.gh.request.side_effect = [self.pr, changed]
+        self.pulls = [self.pr, changed]
         self.loops.merge()
-        self.assertEqual(self.loops.gh.request.call_count, 2)
+        self.assertFalse(any(c.args[0] == 'pulls/2/merge' for c in self.loops.gh.request.call_args_list))
 
     def test_base_moved_during_checks_blocks_merge(self):
         changed = json.loads(json.dumps(self.pr))
         changed['base']['sha'] = 'new-base'
-        self.loops.gh.request.side_effect = [self.pr, changed]
+        self.pulls = [self.pr, changed]
         self.loops.merge()
-        self.assertEqual(self.loops.gh.request.call_count, 2)
+        self.assertFalse(any(c.args[0] == 'pulls/2/merge' for c in self.loops.gh.request.call_args_list))
 
     def test_no_approval_or_failed_ci_never_calls_merge(self):
         for reviews, green in [([], True), ([review()], False)]:
@@ -238,9 +271,9 @@ class MergeController(unittest.TestCase):
 
     def test_mergeability_changed_during_checks_blocks_merge(self):
         changed = dict(self.pr, mergeable_state='blocked')
-        self.loops.gh.request.side_effect = [self.pr, changed]
+        self.pulls = [self.pr, changed]
         self.loops.merge()
-        self.assertEqual(self.loops.gh.request.call_count, 2)
+        self.assertFalse(any(c.args[0] == 'pulls/2/merge' for c in self.loops.gh.request.call_args_list))
 
     def test_old_base_approval_blocks_merge(self):
         self.loops.snapshot.return_value = ([review(base='old-base')], [check()], [], True, [])
@@ -266,14 +299,21 @@ class ReviewController(unittest.TestCase):
                    'user': {'login': 'author'},
                    'head': {'sha': 'head', 'ref': 'agent/issue-1', 'repo': {'full_name': 'owner/repo'}},
                    'base': {'sha': 'base', 'ref': 'main'}}
-        self.goal = {'title': 'Fix the bug', 'body': 'Expected behavior', 'unneeded_metadata': 'omit-me'}
+        self.goal = dict(goal_fixture(), title='Fix the bug', unneeded_metadata='omit-me')
+        self.goal['body'] += '\nExpected behavior'
         self.loops.gh = Mock()
-        self.loops.gh.request.side_effect = [self.pr, self.goal, self.pr, {}]
+        self.pulls = []
+        def request(path, method='GET', data=None):
+            if path == 'pulls/2': return self.pulls.pop(0) if self.pulls else self.pr
+            if path == 'issues/1': return self.goal
+            if path == 'pulls/2/reviews': return {'id': 17}
+            raise AssertionError(path)
+        self.loops.gh.request.side_effect = request
         self.loops.gh.pages.side_effect = [[], [{'filename': 'new.py', 'previous_filename': 'old.py',
              'status': 'renamed', 'patch': 'large-patch-' * 10000, 'additions': 1, 'deletions': 1}]]
         self.loops.workspace = Mock(return_value=(self.root,) * 4)
         self.loops.git = Mock()
-        self.loops.agent = Mock(return_value={'decision': 'APPROVE', 'summary': 'Looks correct'})
+        self.loops.agent = Mock(return_value=verdict_fixture())
         self.archive = patch('loop.tarfile.open')
         self.archive.start()
 
@@ -296,6 +336,8 @@ class ReviewController(unittest.TestCase):
         self.assertIn(review_marker('head', 'base'), payload['body'])
 
     def test_current_review_skips_inference(self):
+        report = self.loops.state.reviews.record(1, 2, 'head', 'base', goal_contract(self.goal), verdict_fixture(), [])
+        self.loops.state.reviews.published(report['id'], 1)
         self.loops.gh.pages.side_effect = [[review()]]
         self.loops.review()
         self.loops.agent.assert_not_called()
@@ -313,9 +355,9 @@ class ReviewController(unittest.TestCase):
     def test_base_change_during_inference_discards_verdict(self):
         changed = json.loads(json.dumps(self.pr))
         changed['base']['sha'] = 'new-base'
-        self.loops.gh.request.side_effect = [self.pr, self.goal, changed]
+        self.pulls = [self.pr, changed]
         self.loops.review()
-        self.assertEqual(self.loops.gh.request.call_count, 3)
+        self.assertTrue(all(c.args[0] != 'pulls/2/reviews' for c in self.loops.gh.request.call_args_list))
         self.assertTrue(all(call.args[0] != 'pulls/2/reviews'
                             for call in self.loops.gh.request.call_args_list))
 

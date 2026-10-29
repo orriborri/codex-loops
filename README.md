@@ -149,6 +149,7 @@ Each observed transition records the goal issue, optional PR, state, reason, nex
 | `waiting_for_review`, `reviewing` | The independent reviewer owns the next step |
 | `changes_requested` | Implementation must address findings or ask for a human decision |
 | `needs_clarification` | A maintainer must answer specific missing requirements |
+| `needs_human_approval` | High-risk merge policy is waiting for exact-revision human approval |
 | `needs_human_decision` | A maintainer must resolve a disputed finding, operational blocker or outstanding older change request |
 | `retry_pending`, `retry_exhausted` | A bounded attempt failed; the controller retries, or a maintainer must intervene once exhausted |
 | `paused` | Work is explicitly paused or no longer eligible |
@@ -220,3 +221,46 @@ Official references:
 - [GitHub pull request reviews](https://docs.github.com/en/rest/pulls/reviews)
 - [GitHub merge API and expected SHA](https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request)
 - [GitHub check runs](https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference)
+
+## Evidence-based reviews and bounded feedback
+
+Queue one outcome per issue with **one to five** explicit acceptance criteria:
+
+```markdown
+## Outcome
+Exports survive a worker restart.
+
+## Acceptance criteria
+- Restarting a worker preserves queued exports.
+- Retrying an export does not create a duplicate file.
+```
+
+`agent:ready` issues without this section stop for clarification before a model job. The title is the outcome when `## Outcome` is omitted. Goals over `MAX_GOAL_CHARS` (default 8000), more than five criteria, `agent:large`, or `## Size` set to `L` require splitting. The agent also checks whether the goal has one outcome. A publish exceeding `MAX_CHANGE_LINES` (default 300 added/deleted application lines across the cumulative PR diff against its base, excluding common test paths and lockfiles) stops for a human split decision before pushing. Binary changes still require review and the risk policy.
+
+The reviewer publishes a review pack containing each criterion's `pass`, `fail` or `unclear` result, concrete evidence, tests/checks, risk assessment, stable finding IDs and recent review/response history. An approval requires every criterion to pass and every blocking finding to be resolved; minor findings remain visible. The report is stored in SQLite and bound to the issue title/body fingerprint, PR head, base and actual GitHub review ID. A source change, base change, goal edit or new implementation response requires fresh independent review. Existing approvals without a stored structured report must be renewed after upgrading. Preserve the shared state database across controller restarts.
+
+Repairs respond to every current blocking finding with `fixed`, `disputed` or `needs_decision` and evidence. The reviewer independently adjudicates those responses; an implementation response never approves itself. A blocker cannot silently disappear or be downgraded. A second consecutive dispute about the same finding, or any `needs_decision`, holds the goal with one question and a recommendation. Findings and responses are retained across restarts, including response-only disputes with no source commit. `agent:resume` resets the dispute cycle and forces fresh independent review before further repair. Automatic retries cannot overwrite a persisted response to the same review record.
+
+The improvement loop receives structured review-round, blocker and recent dispute counts alongside its existing evidence. It still produces proposals under the existing daily/open-issue limits; policy changes follow the ordinary review and merge gates.
+
+## High-risk merge approval
+
+Auth, secrets, payments, migrations, infrastructure and other built-in sensitive file paths require human approval for automatic merging. The reviewer or an `agent:high-risk` label on either issue or PR can also raise risk. `HIGH_RISK_PATHS` adds comma-separated glob patterns; it cannot remove built-in classifications. Once recorded, raised risk persists for the PR across subsequent reviews, revisions and goal edits. A low-risk label or later low-risk model verdict cannot lower it.
+
+Set `RISK_APPROVERS` to comma-separated **human GitHub logins**. The approver must also currently have repository write, maintain or admin permission and must differ from `REVIEWER_LOGIN`. After inspecting the change, that person posts the exact command displayed in the PR review pack (or progress action):
+
+```text
+/agent approve-risk <full-head-sha> <full-base-sha> <goal-fingerprint>
+```
+
+An empty allowlist blocks high-risk automatic merges. Edited goals and changed head/base revisions invalidate the command. CI, independent approval, absence of change requests and branch protection remain required. The runner records `needs_human_approval` while waiting; the exact command unblocks that gate without `agent:resume`. These are separately read GitHub resources, so retain the server-side protections described above; issue/comment changes cannot be checked atomically with the merge API.
+
+## Comparing CI failures with the base
+
+Optionally set `BASELINE_TEST_COMMAND` to a trusted deployment-configured test command, for example `python -m pytest --junitxml=/out/tests.xml`. Build an agent image containing the project's test tools and dependencies first. The command must produce JUnit XML at `/out/tests.xml`; project commands are not automatically inferred from issue text.
+
+When repairing failed CI, the controller runs that same command on both exact revisions in separate disposable containers, with fresh result directories, resource/time limits, and no Codex, GitHub or Opik credential mounts/environment. `BASELINE_TIMEOUT_SECONDS` defaults to 600 per revision. Results, including timeouts or unknown comparisons, are cached per head/base and command/image fingerprint to bound repeated work. Pin the image reference when reproducibility matters.
+
+Test identity uses suite/class/name. New failing IDs are regressions. Matching failures are classified as baseline-only only if every executed base test also ran on the head. Missing, malformed, inconsistent or skipped-away evidence stays unknown; a passing reproduction does not clear failing GitHub CI.
+
+Reproduced base failures create a separate `agent:proposal` repair issue, deduplicated by base revision and command/image fingerprint, with recovery after a lost create response. Mixed failures keep the current repair focused on regressions. Baseline-only failures hold the current goal for a maintainer decision about queuing that separate issue. They never waive CI, autoqueue baseline work or claim to identify the introducing commit. After the base is fixed, resume the original goal to obtain fresh review and CI.
