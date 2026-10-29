@@ -5,4 +5,5 @@ WORKDIR /app
 COPY loop.py /app/loop.py
 COPY workflow.py /app/workflow.py
 COPY telemetry.py /app/telemetry.py
+COPY reviewing.py baseline.py /app/
 ENTRYPOINT ["python", "-u", "/app/loop.py"]

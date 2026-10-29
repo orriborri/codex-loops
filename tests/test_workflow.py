@@ -1,3 +1,5 @@
+from reviewing import goal_contract
+from support import verdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import json
@@ -8,6 +10,7 @@ import urllib.error
 from unittest.mock import Mock, patch
 
 from loop import Loops, State, review_marker
+from support import goal as goal_fixture
 
 
 class WorkflowStorage(unittest.TestCase):
@@ -127,7 +130,7 @@ class WorkflowControllers(unittest.TestCase):
         self.loops.gh = Mock()
         self.loops.repo, self.loops.base, self.loops.reviewer = 'owner/repo', 'main', 'review-bot'
         self.loops.limit, self.loops.required = 2, ['test']
-        self.goal = {'number': 1, 'title': 'Feature', 'body': 'Requirements', 'state': 'open',
+        self.goal = {'number': 1, 'title': 'Feature', 'body': goal_fixture()['body'], 'state': 'open',
                      'labels': [{'name': 'agent:ready'}]}
         self.pr = {'number': 2, 'state': 'open', 'draft': False, 'labels': [],
                    'head': {'sha': 'head', 'ref': 'agent/issue-1', 'repo': {'full_name': 'owner/repo'}},
@@ -164,7 +167,7 @@ class WorkflowControllers(unittest.TestCase):
         self.loops.publish.assert_not_called()
         self.loops.implement()
         self.loops.agent.assert_called_once()
-        self.goal['body'] = 'Use JSON'
+        self.goal['body'] += '\nUse JSON'
         self.loops.agent.return_value = {'outcome': 'completed', 'summary': 'Implemented JSON.'}
         self.loops.implement()
         self.loops.publish.assert_called_once()
@@ -243,6 +246,8 @@ class WorkflowControllers(unittest.TestCase):
         approval = {'id': 1, 'state': 'APPROVED', 'commit_id': 'head', 'user': {'login': 'review-bot'},
                     'body': review_marker('head', 'base')}
         self.loops.snapshot.return_value = ([approval], [], [], True, [])
+        row = self.loops.state.reviews.record(1, 2, 'head', 'base', goal_contract(self.goal), verdict(), [])
+        self.loops.state.reviews.published(row['id'], 1)
         with patch.dict(os.environ, {'AUTO_MERGE': 'false'}):
             self.loops.implement()
         self.assertEqual(self.current(), 'ready_to_merge')
@@ -275,7 +280,7 @@ class ImplementationOutput(unittest.TestCase):
             with patch('loop.agent_auth', return_value=([], {})), \
                  patch('loop.subprocess.run', return_value=Mock(returncode=0)) as run:
                 for outcome in ['completed', 'needs_clarification', 'needs_human_decision']:
-                    (root / 'result.json').write_text(json.dumps({'outcome': outcome, 'summary': 'Details'}))
+                    (root / 'result.json').write_text(json.dumps({'outcome': outcome, 'summary': 'Details', 'finding_responses': []}))
                     self.assertEqual(loops._agent(root, root, 'Goal')['outcome'], outcome)
                     command = run.call_args_list[-2].args[0]
                     self.assertIn('--output-schema', command)

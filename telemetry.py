@@ -81,6 +81,10 @@ class Telemetry:
             output = {'execution': outcome}
             scores = {'execution_success': int(outcome == 'success')}
             if isinstance(result, dict):
+                metadata['criteria_passed'] = sum(c.get('result') == 'pass' for c in result.get('criteria', []))
+                metadata['open_blockers'] = sum(f.get('severity') == 'blocking' and f.get('status') == 'open'
+                                                for f in result.get('findings', []))
+                metadata['disputes'] = sum(r.get('status') == 'disputed' for r in result.get('finding_responses', []))
                 # Only controller-validated enum/boolean values, never summaries or findings.
                 if result.get('decision') in ('APPROVE', 'REQUEST_CHANGES'):
                     output['decision'] = result['decision']

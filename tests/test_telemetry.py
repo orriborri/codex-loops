@@ -242,7 +242,7 @@ class TelemetryTests(unittest.TestCase):
         pr = {'number': 2, 'state': 'open', 'draft': False, 'labels': [],
               'head': {'sha': 'a' * 40, 'ref': 'agent/issue-1', 'repo': {'full_name': 'owner/repo'}},
               'base': {'sha': 'b' * 40, 'ref': 'main'}, 'mergeable': True}
-        goal = {'number': 1, 'state': 'open', 'title': 'Private goal', 'body': 'Private details', 'labels': []}
+        goal = {'number': 1, 'state': 'open', 'title': 'Private goal', 'body': '## Acceptance criteria\n- Private details', 'labels': []}
         loops.gh = Mock()
         loops.gh.request.side_effect = lambda path, *args: pr if path == 'pulls/2' else goal
         loops.gh.pages.return_value = []
