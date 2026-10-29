@@ -78,6 +78,36 @@ docker compose --profile auth run --rm login login --device-auth
 
 Keep the volume between restarts; `docker compose down -v` deletes the saved login. Protect volume backups as credentials. Do not run another stack or desktop CLI concurrently against this credential cache; use a distinct dedicated login/volume per runner. GitHub tokens are still required separately. Official OpenAI guidance recommends API keys as the default for programmatic CI/CD; saved account auth is an advanced option for trusted runners.
 
+## Optional Opik tracing and outcome tracking
+
+The controllers can export metadata-only traces to a self-hosted Opik instance or Opik Cloud. This is optional and disabled by default; no Opik service or SDK is required to run the loops.
+
+Configure `.env` after you have an Opik endpoint reachable from the controller containers:
+
+```dotenv
+OPIK_ENABLED=true
+OPIK_URL_OVERRIDE=http://opik.your-lan:5173/api
+OPIK_PROJECT_NAME=codex-loops
+```
+
+For Opik Cloud use `OPIK_URL_OVERRIDE=https://www.comet.com/opik/api`, plus your `OPIK_API_KEY` and `OPIK_WORKSPACE`. Keep credentials in your local `.env`. Rebuild and recreate the controllers (`docker compose up -d --build implement review merge`); recreate the optional `improve` service too if enabled. An address such as `localhost:5173` inside a controller refers to that container, not the Docker host. This change connects to Opik; it does not deploy the Opik server.
+
+Each model job emits a trace containing its role, configured model (or `<cli-default>`), duration, prompt byte count and SHA-256 hash, execution outcome, and validated decision/outcome enums. The controller source fingerprint identifies the implementation and its embedded prompts; the full prompt hash is task-specific, not a standalone prompt-template version. Jobs with an active issue/PR include their issue, PR and bounded attempt number. Current head/base SHAs are included when the workflow observation provides them.
+
+Workflow changes emit separate traces, including CI failure, waiting for review, ready to merge, retry exhaustion, merged, and closed. Job and workflow traces share a thread per repository/issue, so repair/review rounds can be inspected together. Polls that observe the same state do not create duplicates. Improvement jobs are repository-wide rather than tied to one issue.
+
+Numeric feedback scores distinguish execution success, the implementer's reported completion, the model review verdict, observed CI readiness/failure and confirmed merge/closure. A model's successful execution is not evidence that tests passed. A model approval is not a GitHub approval: the existing controllers still submit and verify the actual review. Merging is not deployment or proof that a change has no defects. No tokens, monetary costs or test pass counts are invented from prompt size or wall time.
+
+Raw prompts, issue titles/bodies, source code, summaries, review findings, CI logs, exception messages and credential values are **not exported**. Free-text reasons and next actions remain on the runner/GitHub. Opik configuration and keys stay in controllers; job containers receive no Opik settings. Disable export with `OPIK_ENABLED=false` and recreate controllers.
+
+A SQLite outbox in the existing runner database preserves pending exports across restarts. Each iteration attempts at most 50 traces, then their numeric scores, using `OPIK_TIMEOUT_SECONDS` per HTTP request (default 2, capped at 10). Unavailable endpoints, authentication errors or invalid configuration do not change job results or GitHub merge gates. Failed exports keep stable UUIDv7 IDs for retry; a lost acknowledgement can resend an existing trace/score. Export is best-effort, not exactly-once delivery. Redirects are rejected rather than forwarding credentials or traces to another URL.
+
+The queue holds at most `OPIK_MAX_PENDING` pending traces (default 10,000). When full, new telemetry is dropped with a warning so runner disk usage cannot grow indefinitely from Opik alone. Enabled workflow history is collected in bounded batches; existing history from before first enablement is not backfilled. A slow endpoint can add up to two HTTP timeouts to a poll. A hard crash during a model job may leave that job without a completed trace. Pending rows retain their original project name, but delivery uses the currently configured endpoint/workspace: drain or clear the pending queue before switching destinations. Disabled tracing retains pending rows without transmitting them.
+
+This first integration provides measurements and failure examples. It does not add automatic prompt optimization or benchmark replay. Those require curated tasks, independent acceptance tests, and held-out comparisons before proposing prompt changes through normal PR review.
+
+API references: [trace batch ingestion](https://www.comet.com/docs/opik/reference/rest-api/traces/create-traces), [trace feedback scores](https://www.comet.com/docs/opik/reference/rest-api/traces/score-batch-of-traces), and [REST configuration](https://www.comet.com/docs/opik/reference/rest-api/overview).
+
 ## GitHub identities and permissions
 
 The PR author and reviewer **must be distinct GitHub identities**. Separate PATs belonging to the same person are not distinct identities. Prefer dedicated bots or GitHub Apps; short-lived App tokens need an external refresh/restart mechanism because this starter reads static tokens from environment variables.
@@ -119,6 +149,7 @@ Each observed transition records the goal issue, optional PR, state, reason, nex
 | `waiting_for_review`, `reviewing` | The independent reviewer owns the next step |
 | `changes_requested` | Implementation must address findings or ask for a human decision |
 | `needs_clarification` | A maintainer must answer specific missing requirements |
+| `needs_human_approval` | High-risk merge policy is waiting for exact-revision human approval |
 | `needs_human_decision` | A maintainer must resolve a disputed finding, operational blocker or outstanding older change request |
 | `retry_pending`, `retry_exhausted` | A bounded attempt failed; the controller retries, or a maintainer must intervene once exhausted |
 | `paused` | Work is explicitly paused or no longer eligible |
@@ -190,3 +221,46 @@ Official references:
 - [GitHub pull request reviews](https://docs.github.com/en/rest/pulls/reviews)
 - [GitHub merge API and expected SHA](https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request)
 - [GitHub check runs](https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference)
+
+## Evidence-based reviews and bounded feedback
+
+Queue one outcome per issue with **one to five** explicit acceptance criteria:
+
+```markdown
+## Outcome
+Exports survive a worker restart.
+
+## Acceptance criteria
+- Restarting a worker preserves queued exports.
+- Retrying an export does not create a duplicate file.
+```
+
+`agent:ready` issues without this section stop for clarification before a model job. The title is the outcome when `## Outcome` is omitted. Goals over `MAX_GOAL_CHARS` (default 8000), more than five criteria, `agent:large`, or `## Size` set to `L` require splitting. The agent also checks whether the goal has one outcome. A publish exceeding `MAX_CHANGE_LINES` (default 300 added/deleted application lines across the cumulative PR diff against its base, excluding common test paths and lockfiles) stops for a human split decision before pushing. Binary changes still require review and the risk policy.
+
+The reviewer publishes a review pack containing each criterion's `pass`, `fail` or `unclear` result, concrete evidence, tests/checks, risk assessment, stable finding IDs and recent review/response history. An approval requires every criterion to pass and every blocking finding to be resolved; minor findings remain visible. The report is stored in SQLite and bound to the issue title/body fingerprint, PR head, base and actual GitHub review ID. A source change, base change, goal edit or new implementation response requires fresh independent review. Existing approvals without a stored structured report must be renewed after upgrading. Preserve the shared state database across controller restarts.
+
+Repairs respond to every current blocking finding with `fixed`, `disputed` or `needs_decision` and evidence. The reviewer independently adjudicates those responses; an implementation response never approves itself. A blocker cannot silently disappear or be downgraded. A second consecutive dispute about the same finding, or any `needs_decision`, holds the goal with one question and a recommendation. Findings and responses are retained across restarts, including response-only disputes with no source commit. `agent:resume` resets the dispute cycle and forces fresh independent review before further repair. Automatic retries cannot overwrite a persisted response to the same review record.
+
+The improvement loop receives structured review-round, blocker and recent dispute counts alongside its existing evidence. It still produces proposals under the existing daily/open-issue limits; policy changes follow the ordinary review and merge gates.
+
+## High-risk merge approval
+
+Auth, secrets, payments, migrations, infrastructure and other built-in sensitive file paths require human approval for automatic merging. The reviewer or an `agent:high-risk` label on either issue or PR can also raise risk. `HIGH_RISK_PATHS` adds comma-separated glob patterns; it cannot remove built-in classifications. Once recorded, raised risk persists for the PR across subsequent reviews, revisions and goal edits. A low-risk label or later low-risk model verdict cannot lower it.
+
+Set `RISK_APPROVERS` to comma-separated **human GitHub logins**. The approver must also currently have repository write, maintain or admin permission and must differ from `REVIEWER_LOGIN`. After inspecting the change, that person posts the exact command displayed in the PR review pack (or progress action):
+
+```text
+/agent approve-risk <full-head-sha> <full-base-sha> <goal-fingerprint>
+```
+
+An empty allowlist blocks high-risk automatic merges. Edited goals and changed head/base revisions invalidate the command. CI, independent approval, absence of change requests and branch protection remain required. The runner records `needs_human_approval` while waiting; the exact command unblocks that gate without `agent:resume`. These are separately read GitHub resources, so retain the server-side protections described above; issue/comment changes cannot be checked atomically with the merge API.
+
+## Comparing CI failures with the base
+
+Optionally set `BASELINE_TEST_COMMAND` to a trusted deployment-configured test command, for example `python -m pytest --junitxml=/out/tests.xml`. Build an agent image containing the project's test tools and dependencies first. The command must produce JUnit XML at `/out/tests.xml`; project commands are not automatically inferred from issue text.
+
+When repairing failed CI, the controller runs that same command on both exact revisions in separate disposable containers, with fresh result directories, resource/time limits, and no Codex, GitHub or Opik credential mounts/environment. `BASELINE_TIMEOUT_SECONDS` defaults to 600 per revision. Results, including timeouts or unknown comparisons, are cached per head/base and command/image fingerprint to bound repeated work. Pin the image reference when reproducibility matters.
+
+Test identity uses suite/class/name. New failing IDs are regressions. Matching failures are classified as baseline-only only if every executed base test also ran on the head. Missing, malformed, inconsistent or skipped-away evidence stays unknown; a passing reproduction does not clear failing GitHub CI.
+
+Reproduced base failures create a separate `agent:proposal` repair issue, deduplicated by base revision and command/image fingerprint, with recovery after a lost create response. Mixed failures keep the current repair focused on regressions. Baseline-only failures hold the current goal for a maintainer decision about queuing that separate issue. They never waive CI, autoqueue baseline work or claim to identify the introducing commit. After the base is fixed, resume the original goal to obtain fresh review and CI.
