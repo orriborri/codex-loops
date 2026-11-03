@@ -3,7 +3,9 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
+import tempfile
 import uuid
 import xml.etree.ElementTree as ET
 from reviewing import display
@@ -56,6 +58,24 @@ def compare_tests(head, base):
     return result
 
 
+def repair_receipt(before, after):
+    """Summarize observed regression IDs; this is not a CI or test-integrity guarantee."""
+    receipt = {'status': 'unknown', 'before_regressions': len(before.get('regressions', [])),
+               'missing_before_regressions': None, 'observed_regressions': None}
+    if before.get('classification') != 'regression' or after.get('status') == 'unknown':
+        return receipt
+    previous = set(before['regressions'])
+    missing = previous - set(after['tests'])
+    observed = set(after['failures']) - set(before['baseline_failures'])
+    receipt['missing_before_regressions'] = len(missing)
+    receipt['observed_regressions'] = len(observed)
+    if observed:
+        receipt['status'] = 'failed'
+    elif not missing and previous:
+        receipt['status'] = 'passed'
+    return receipt
+
+
 class BaselineChecks:
     def __init__(self, db):
         self.db = db
@@ -87,6 +107,21 @@ class BaselineChecks:
             self.db.execute('INSERT OR REPLACE INTO baseline_checks VALUES (?,?,?,?)',
                             (head, base, command_hash, json.dumps(result)))
         return result
+
+    def postflight(self, job, source, output, before):
+        """Reproduce in an isolated copy so test commands cannot mutate pending changes."""
+        command = os.getenv('BASELINE_TEST_COMMAND', '').strip()
+        if not command:
+            return repair_receipt(before, {'status': 'unknown'})
+        copy_root = Path(tempfile.mkdtemp(prefix='postflight-', dir=job))
+        copy = copy_root / 'source'
+        shutil.copytree(source, copy, symlinks=True)
+        for path in [copy, *copy.rglob('*')]:
+            os.chown(path, 1000, 1000, follow_symlinks=False)
+        result = self.run(copy, output, command, os.getenv('AGENT_IMAGE', 'codex-loops-agent:local'))
+        receipt = repair_receipt(before, result)
+        receipt.update(head=before['head'], base=before['base'], command_hash=before['command_hash'])
+        return receipt
 
     @staticmethod
     def run(source, output, command, image):

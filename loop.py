@@ -20,7 +20,8 @@ import urllib.request
 import uuid
 from workflow import Workflow, goal_fingerprint
 from telemetry import Telemetry
-from baseline import BaselineChecks
+from baseline import BaselineChecks, repair_receipt
+from lessons import advisory
 from reviewing import (ReviewLog, goal_contract, implementation_schema, review_schema,
                        validate_shape, render_pack, risk_reasons, risk_approved, risk_command,
                        ChangeTooLarge, changed_lines)
@@ -271,6 +272,7 @@ class Loops:
                       'The implementation agent is working on the current goal.',
                       'implement', 'Wait for the bounded model job to finish.', revision)
         self.sync_progress()
+        prompt += advisory(getattr(self, 'root', None), self.repo, goal)
         report = self.state.reviews.latest(pr) if pr is not None else None
         if report and (report['goal_hash'] != goal_contract(goal)['fingerprint'] or not self.state.reviews.active(report)):
             report = None
@@ -567,6 +569,21 @@ class Loops:
                     'annotations': annotations, 'merge_conflict': conflict, 'baseline_comparison': baseline_result}), goal,
                 revision=pr['head']['sha'] + ':' + pr['base']['sha']):
                 return
+            receipt = None
+            if (os.getenv('REPAIR_RECEIPT_ENABLED', 'false').lower() == 'true'
+                    and baseline_result and baseline_result['classification'] == 'regression'):
+                try:
+                    receipt = self.state.baselines.postflight(job, source, output, baseline_result)
+                except Exception as exc:
+                    # This diagnostic is advisory and never controls publishing or merge gates.
+                    LOG.warning('Post-repair reproduction unavailable (%s)', type(exc).__name__)
+                    receipt = repair_receipt(baseline_result, {'status': 'unknown'})
+                    receipt.update(head=baseline_result['head'], base=baseline_result['base'],
+                                   command_hash=baseline_result['command_hash'])
+                try:
+                    (control / 'repair-receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
+                except OSError as exc:
+                    LOG.warning('Post-repair receipt could not be saved (%s)', type(exc).__name__)
             current = self.gh.request(f'pulls/{number}')
             if (not self.valid(current) or current['head']['sha'] != pr['head']['sha']
                     or current['base']['sha'] != pr['base']['sha']
@@ -576,7 +593,10 @@ class Loops:
                          allow_no_changes=getattr(self, 'response_only', False), base_revision=pr['base']['sha'])
             with self.state.db:
                 self.state.db.execute('INSERT OR IGNORE INTO fixes VALUES (?,?)', (number, fingerprint))
-            self.progress(issue, number, 'waiting_for_review', 'Repair work or finding responses are ready for independent review.',
+            reason = 'Repair work or finding responses are ready for independent review.'
+            if receipt is not None:
+                reason += ' Advisory post-repair reproduction: ' + receipt['status'] + '; required GitHub CI remains authoritative.'
+            self.progress(issue, number, 'waiting_for_review', reason,
                           'review', 'Re-check findings and the current revision; CI remains required.')
             return
         for issue in self.gh.pages('issues?state=open&labels=agent%3Aready&sort=created&direction=asc'):

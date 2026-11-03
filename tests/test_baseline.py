@@ -5,7 +5,7 @@ import subprocess
 from unittest.mock import Mock, patch
 import tempfile
 import unittest
-from baseline import BaselineChecks, parse_junit, compare_tests
+from baseline import BaselineChecks, parse_junit, compare_tests, repair_receipt
 
 
 class BaselineTests(unittest.TestCase):
@@ -83,6 +83,38 @@ class BaselineTests(unittest.TestCase):
 
 
 class BaselineExecution(unittest.TestCase):
+    def test_receipt_tracks_previous_and_new_regression_ids_conservatively(self):
+        before = {'classification': 'regression', 'regressions': ['new'],
+                  'baseline_failures': ['old']}
+        def after(tests, failures):
+            return {'status': 'failed' if failures else 'passed', 'tests': tests, 'failures': failures}
+        self.assertEqual(repair_receipt(before, after(['old', 'new'], ['old']))['status'], 'passed')
+        self.assertEqual(repair_receipt(before, after(['old', 'new'], ['old', 'new']))['status'], 'failed')
+        self.assertEqual(repair_receipt(before, after(['old'], ['old']))['status'], 'unknown')
+        self.assertEqual(repair_receipt(before, after(['old', 'new', 'extra'], ['extra']))['status'], 'failed')
+        self.assertEqual(repair_receipt(before, {'status': 'unknown'})['status'], 'unknown')
+
+    def test_postflight_runs_on_copy_and_does_not_mutate_pending_source(self):
+        with tempfile.TemporaryDirectory() as root:
+            root = Path(root); source = root / 'source'; output = root / 'output'
+            source.mkdir(); output.mkdir()
+            (source / 'app.py').write_text('pending implementation')
+            db = sqlite3.connect(':memory:')
+            try:
+                checks = BaselineChecks(db)
+                def test_run(copy, _output, command, image):
+                    self.assertNotEqual(copy, source)
+                    (copy / 'app.py').write_text('test command modified copy')
+                    return {'status': 'passed', 'tests': ['new'], 'failures': []}
+                checks.run = Mock(side_effect=test_run)
+                before = {'classification': 'regression', 'regressions': ['new'], 'baseline_failures': [],
+                          'head': 'h', 'base': 'b', 'command_hash': 'fingerprint'}
+                with patch.dict(os.environ, {'BASELINE_TEST_COMMAND': 'tests'}), patch('baseline.os.chown'):
+                    receipt = checks.postflight(root, source, output, before)
+                self.assertEqual(receipt['status'], 'passed')
+                self.assertEqual((source / 'app.py').read_text(), 'pending implementation')
+            finally:
+                db.close()
     def test_reproduction_job_has_no_credential_mounts_or_environment(self):
         with tempfile.TemporaryDirectory() as root:
             folder = Path(root)
