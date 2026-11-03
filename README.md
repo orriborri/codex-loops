@@ -264,3 +264,45 @@ When repairing failed CI, the controller runs that same command on both exact re
 Test identity uses suite/class/name. New failing IDs are regressions. Matching failures are classified as baseline-only only if every executed base test also ran on the head. Missing, malformed, inconsistent or skipped-away evidence stays unknown; a passing reproduction does not clear failing GitHub CI.
 
 Reproduced base failures create a separate `agent:proposal` repair issue, deduplicated by base revision and command/image fingerprint, with recovery after a lost create response. Mixed failures keep the current repair focused on regressions. Baseline-only failures hold the current goal for a maintainer decision about queuing that separate issue. They never waive CI, autoqueue baseline work or claim to identify the introducing commit. After the base is fixed, resume the original goal to obtain fresh review and CI.
+
+## Optional historical notes
+
+Ruflo's bounded, source-linked recall inspired a small advisory feature. It is disabled by default. Set `LESSONS_ENABLED=true` and place a maintainer-curated `lessons.json` in `WORK_ROOT` on the runner. Agent jobs cannot write this file: it is not mounted into their containers. For example:
+
+```json
+{
+  "version": 1,
+  "lessons": [
+    {
+      "id": "retry-ids",
+      "repository": "owner/repository",
+      "approved": true,
+      "keywords": ["retry", "export"],
+      "lesson": "Check that retries reuse the persisted export ID.",
+      "evidence": {"type": "pull", "number": 42},
+      "reviewed": "2026-10-01",
+      "expires": "2027-04-01"
+    }
+  ]
+}
+```
+
+Replace the example with evidence from the actual target repository. Only explicitly approved, unexpired entries for the configured repository that match whole keywords in the goal are included in implementation/repair prompts. Each entry needs a GitHub issue or PR number, review date and expiry; the controller constructs the source URL for the configured repository but does not verify the linked item or the approver's identity. Protect write access to this file as maintainer-level access. It selects at most three items and 1,500 serialized characters from a file of at most 64 KiB and 100 entries. Invalid entries, symlinks, malformed files and inaccessible files are ignored; work continues without recall. Revoke a lesson by removing it or setting `approved` to `false`; edit dates when a maintainer reviews it again.
+
+Notes are framed as untrusted and potentially stale evidence, not policy or instructions. Reviewers do not receive them through this feature. They do not change tests, permissions or review/merge decisions, and model output is never automatically added to the file. Selected text is sent to the configured model provider and may appear in local job output. Store no secrets or private material that should not be sent there; keyword matching is not a security classifier. Do not rely on a prompt boundary alone to stop prompt injection.
+
+## Optional post-repair test receipt
+
+Set `REPAIR_RECEIPT_ENABLED=true` together with `BASELINE_TEST_COMMAND` to re-run the configured JUnit command after a model repair when the preceding head/base comparison identified regression test IDs. This adds one test container invocation per qualifying repair, bounded by `BASELINE_TIMEOUT_SECONDS` and the same CPU/memory limits. The command runs against a disposable copy of the proposed source, so test-side writes do not change the files being prepared for publication. As with baseline reproduction, the container receives no Codex, GitHub or Opik credentials.
+
+The local `job-*/control/repair-receipt.json` records the original head/base and command fingerprint, counts of previous regressions, still-observed regressions and missing original regression IDs, and an advisory status:
+
+When reproduction is unavailable, the after-test counts are null rather than zero.
+
+- `passed`: the original regression IDs ran and no non-baseline failures were observed.
+- `failed`: at least one non-baseline failure ID was observed.
+- `unknown`: test output was unavailable/inconsistent, or an original regression ID was missing or skipped without another observed regression.
+
+The workflow progress observation includes the status, and the current repair proceeds even if reproduction fails or reports `failed`. This is a diagnostic, not a merge gate: tests may be incomplete or changed by the repair, and this feature does not detect test tampering or prove correctness. Required GitHub CI, independent review and all existing merge gates remain authoritative. Receipt data stays on the runner and is not exported as raw content to Opik.
+
+See [the Ruflo investigation](docs/research/ruflo-inspiration.md) for the source links, rejected alternatives and limitations.

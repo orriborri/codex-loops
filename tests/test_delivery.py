@@ -16,6 +16,7 @@ class DeliveryFlow(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.loops = object.__new__(Loops)
+        self.loops.root = self.root
         self.loops.repo, self.loops.base, self.loops.reviewer = 'owner/repo', 'main', 'review-bot'
         self.loops.limit, self.loops.required = 5, ['test']
         self.loops.state = State(self.root)
@@ -106,6 +107,47 @@ class DeliveryFlow(unittest.TestCase):
         self.assertIn('Restart test', self.reviews[0]['body'])
         self.loops.merge()
         self.assertEqual(self.merges, [{'sha': 'a' * 40, 'merge_method': 'squash'}])
+
+    def test_curated_recall_reaches_only_implementation_prompt(self):
+        self.root.joinpath('lessons.json').write_text(json.dumps({'version': 1, 'lessons': [{
+            'id': 'retry', 'repository': 'owner/repo', 'approved': True, 'keywords': ['retry'],
+            'lesson': 'Keep retry identifiers stable.', 'evidence': {'type': 'pull', 'number': 12},
+            'reviewed': '2020-01-01', 'expires': '2099-01-01'}]}))
+        with patch.dict(os.environ, {'LESSONS_ENABLED': 'true'}):
+            self.loops._agent.return_value = {'outcome': 'completed', 'summary': 'Done.', 'finding_responses': []}
+            self.assertTrue(self.loops.run_work(1, None, self.root, self.root, 'Implement', self.goal))
+            self.assertIn('UNTRUSTED', self.loops._agent.call_args.args[2])
+            self.review()
+            self.assertNotIn('Keep retry identifiers stable.', self.loops._agent.call_args.args[2])
+
+    def test_postrepair_receipt_is_advisory_and_persisted_outside_model_source(self):
+        self.ci_good = False
+        before = {'classification': 'regression', 'regressions': ['new'], 'baseline_failures': [],
+                  'head': 'a' * 40, 'base': 'b' * 40, 'command_hash': 'fingerprint'}
+        self.loops.state.baselines.compare = Mock(return_value=before)
+        self.loops.state.baselines.postflight = Mock(return_value={'status': 'failed'})
+        self.loops._agent.return_value = {'outcome': 'completed', 'summary': 'Done.', 'finding_responses': []}
+        with patch.dict(os.environ, {'REPAIR_RECEIPT_ENABLED': 'true'}):
+            self.loops.implement()
+        self.loops.publish.assert_called_once()
+        stored = json.loads((self.root / 'job-1' / 'control' / 'repair-receipt.json').read_text())
+        self.assertEqual(stored['status'], 'failed')
+        reason = self.loops.state.db.execute('SELECT reason FROM workflow WHERE issue=1').fetchone()[0]
+        self.assertIn('advisory', reason.lower())
+        self.assertIn('GitHub CI remains authoritative', reason)
+
+    def test_postrepair_failure_does_not_prevent_publish(self):
+        self.ci_good = False
+        before = {'classification': 'regression', 'regressions': ['new'], 'baseline_failures': [],
+                  'head': 'a' * 40, 'base': 'b' * 40, 'command_hash': 'fingerprint'}
+        self.loops.state.baselines.compare = Mock(return_value=before)
+        self.loops.state.baselines.postflight = Mock(side_effect=OSError('test failure'))
+        self.loops._agent.return_value = {'outcome': 'completed', 'summary': 'Done.', 'finding_responses': []}
+        with patch.dict(os.environ, {'REPAIR_RECEIPT_ENABLED': 'true'}):
+            self.loops.implement()
+        self.loops.publish.assert_called_once()
+        stored = json.loads((self.root / 'job-1' / 'control' / 'repair-receipt.json').read_text())
+        self.assertEqual(stored['status'], 'unknown')
 
     def test_later_low_risk_review_cannot_clear_a_raised_risk(self):
         data = verdict(); data['risk'] = 'high'
