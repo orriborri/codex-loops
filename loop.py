@@ -398,6 +398,23 @@ class Loops:
     def _agent(self, source, output, prompt, review=False, improve=False, baseline=None):
         schema = agent_schema(review, improve)
         (output / 'schema.json').write_text(json.dumps(schema))
+        backend = os.getenv('JOB_BACKEND', 'docker')
+        if backend == 'kubernetes':
+            from kube_runner import KubernetesRunner
+            command = ['codex', '-c', 'cli_auth_credentials_store="file"', 'exec',
+                       '--skip-git-repo-check', '--ephemeral', '--sandbox', 'danger-full-access',
+                       '--output-last-message', '/out/result.json']
+            model = agent_model(review, improve)
+            if model:
+                command += ['--model', model]
+            command += ['--output-schema', '/out/schema.json', '-']
+            result = KubernetesRunner().run(source, output, command,
+                int(os.getenv('JOB_TIMEOUT_SECONDS', '1800')), prompt=prompt, review=review, baseline=baseline)
+            if result:
+                raise RuntimeError('Codex job failed; inspect output/events.log')
+            return parse_agent_output((output / 'result.json').read_text(), schema)
+        if backend != 'docker':
+            raise ValueError('JOB_BACKEND must be docker or kubernetes')
         auth_args, job_env = agent_auth()
         name = 'codex-job-' + uuid.uuid4().hex
         command = ['docker', 'run', '--rm', '--init', '--name', name, '--user', '1000:1000',

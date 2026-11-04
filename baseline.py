@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import tarfile
 import uuid
 import xml.etree.ElementTree as ET
 from reviewing import display
@@ -94,6 +95,22 @@ class BaselineChecks:
         results = output / ('baseline-' + uuid.uuid4().hex)
         results.mkdir()
         os.chown(results, 1000, 1000)
+        backend = os.getenv('JOB_BACKEND', 'docker')
+        if backend == 'kubernetes':
+            from kube_runner import KubernetesRunner
+            try:
+                runner = KubernetesRunner()
+                runner.image = image
+                code = runner.run(source, results, ['bash', '-lc', command],
+                                  int(os.getenv('BASELINE_TIMEOUT_SECONDS', '600')))
+                log = results / 'events.log'
+                if log.is_file() and not log.is_symlink():
+                    log.rename(results / 'test.log')
+                return parse_junit(results, code)
+            except (OSError, RuntimeError, ValueError, TimeoutError, subprocess.TimeoutExpired, tarfile.TarError):
+                return {'status': 'unknown', 'tests': [], 'failures': []}
+        if backend != 'docker':
+            raise ValueError('JOB_BACKEND must be docker or kubernetes')
         name = 'codex-test-' + uuid.uuid4().hex
         args = ['docker', 'run', '--rm', '--init', '--name', name, '--user', '1000:1000',
                 '--cap-drop=ALL', '--security-opt=no-new-privileges', '--read-only',

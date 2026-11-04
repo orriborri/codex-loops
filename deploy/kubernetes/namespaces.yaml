@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: codex-loops
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: codex-loops-jobs
+  labels:
+    pod-security.kubernetes.io/enforce: restricted

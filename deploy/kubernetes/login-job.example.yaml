@@ -1,0 +1,58 @@
+# Apply manually only while all controller processes are stopped.
+# Replace the image with the same pinned image used for AGENT_IMAGE.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: codex-login
+  namespace: codex-loops-jobs
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  ttlSecondsAfterFinished: 600
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: login
+          image: ghcr.io/example/codex-loops-agent:replace-me
+          command: [python3, -c, "import time; time.sleep(1800)"]
+          env:
+            - name: HOME
+              value: /tmp/home
+            - name: CODEX_HOME
+              value: /home/node/.codex
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+              ephemeral-storage: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+              ephemeral-storage: 512Mi
+          volumeMounts:
+            - name: auth
+              mountPath: /home/node/.codex
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: auth
+          persistentVolumeClaim:
+            claimName: codex-auth
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 128Mi

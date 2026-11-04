@@ -264,3 +264,7 @@ When repairing failed CI, the controller runs that same command on both exact re
 Test identity uses suite/class/name. New failing IDs are regressions. Matching failures are classified as baseline-only only if every executed base test also ran on the head. Missing, malformed, inconsistent or skipped-away evidence stays unknown; a passing reproduction does not clear failing GitHub CI.
 
 Reproduced base failures create a separate `agent:proposal` repair issue, deduplicated by base revision and command/image fingerprint, with recovery after a lost create response. Mixed failures keep the current repair focused on regressions. Baseline-only failures hold the current goal for a maintainer decision about queuing that separate issue. They never waive CI, autoqueue baseline work or claim to identify the introducing commit. After the base is fixed, resume the original goal to obtain fresh review and CI.
+
+## Kubernetes
+
+An optional Kubernetes Job backend and an operator-editable Kustomize example are in [deploy/kubernetes](deploy/kubernetes/README.md). It uses a single controller Pod with shared SQLite state and separate disposable agent Jobs; no host Docker socket is required. The example starts with auto-merge disabled and needs images, secrets and a device sign-in before use. The deployment is not applied automatically.

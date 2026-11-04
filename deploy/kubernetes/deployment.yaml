@@ -1,0 +1,215 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codex-loops
+  namespace: codex-loops
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: codex-loops
+  template:
+    metadata:
+      labels:
+        app: codex-loops
+    spec:
+      serviceAccountName: codex-loops-controller
+      automountServiceAccountToken: false
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: implement
+        image: ghcr.io/example/codex-loops-controller:replace-me
+        imagePullPolicy: IfNotPresent
+        envFrom:
+        - configMapRef:
+            name: codex-loops-config
+        env:
+        - name: HOME
+          value: /tmp
+        - name: GH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: codex-github-tokens
+              key: implement
+              optional: false
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - CHOWN
+            - DAC_OVERRIDE
+            - FOWNER
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: '1'
+            memory: 1Gi
+        volumeMounts:
+        - name: state
+          mountPath: /work
+        - name: tmp
+          mountPath: /tmp
+        - name: worker-api
+          mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+          readOnly: true
+        args:
+        - implement
+      - name: review
+        image: ghcr.io/example/codex-loops-controller:replace-me
+        imagePullPolicy: IfNotPresent
+        envFrom:
+        - configMapRef:
+            name: codex-loops-config
+        env:
+        - name: HOME
+          value: /tmp
+        - name: GH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: codex-github-tokens
+              key: review
+              optional: false
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - CHOWN
+            - DAC_OVERRIDE
+            - FOWNER
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: '1'
+            memory: 1Gi
+        volumeMounts:
+        - name: state
+          mountPath: /work
+        - name: tmp
+          mountPath: /tmp
+        - name: worker-api
+          mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+          readOnly: true
+        args:
+        - review
+      - name: merge
+        image: ghcr.io/example/codex-loops-controller:replace-me
+        imagePullPolicy: IfNotPresent
+        envFrom:
+        - configMapRef:
+            name: codex-loops-config
+        env:
+        - name: HOME
+          value: /tmp
+        - name: GH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: codex-github-tokens
+              key: merge
+              optional: false
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - CHOWN
+            - DAC_OVERRIDE
+            - FOWNER
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: '1'
+            memory: 1Gi
+        volumeMounts:
+        - name: state
+          mountPath: /work
+        - name: tmp
+          mountPath: /tmp
+        args:
+        - merge
+      - name: improve
+        image: ghcr.io/example/codex-loops-controller:replace-me
+        imagePullPolicy: IfNotPresent
+        envFrom:
+        - configMapRef:
+            name: codex-loops-config
+        env:
+        - name: HOME
+          value: /tmp
+        - name: GH_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: codex-github-tokens
+              key: improve
+              optional: true
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - CHOWN
+            - DAC_OVERRIDE
+            - FOWNER
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: '1'
+            memory: 1Gi
+        volumeMounts:
+        - name: state
+          mountPath: /work
+        - name: tmp
+          mountPath: /tmp
+        - name: worker-api
+          mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+          readOnly: true
+        command:
+        - /bin/sh
+        - -c
+        args:
+        - if [ "$IMPROVE_ENABLED" = "true" ]; then exec python -u /app/loop.py improve;
+          else exec sleep infinity; fi
+      volumes:
+      - name: state
+        persistentVolumeClaim:
+          claimName: codex-loops-state
+      - name: tmp
+        emptyDir:
+          sizeLimit: 1Gi
+      - name: worker-api
+        projected:
+          sources:
+          - serviceAccountToken:
+              path: token
+              expirationSeconds: 3600
+          - configMap:
+              name: kube-root-ca.crt
+              items:
+              - key: ca.crt
+                path: ca.crt
+          - downwardAPI:
+              items:
+              - path: namespace
+                fieldRef:
+                  fieldPath: metadata.namespace
