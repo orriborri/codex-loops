@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: codex-loops-config
+  namespace: codex-loops
+data:
+  GITHUB_REPOSITORY: REPLACE_OWNER/REPLACE_REPOSITORY
+  REVIEWER_LOGIN: REPLACE_REVIEWER_LOGIN
+  REQUIRED_CHECKS: REPLACE_WITH_CHECK_NAMES
+  BASE_BRANCH: main
+  WORK_ROOT: /work
+  JOB_BACKEND: kubernetes
+  KUBE_JOB_NAMESPACE: codex-loops-jobs
+  KUBE_RUNNER_ID: codex-loops
+  KUBE_CODEX_AUTH_PVC: codex-auth
+  KUBE_MODEL_SECRET: codex-model-auth
+  AGENT_IMAGE: ghcr.io/REPLACE_OWNER/codex-loops-agent:REPLACE_TAG
+  AUTH_MODE: codex
+  AUTO_MERGE: "false"
+  RISK_APPROVERS: ""
+  AUTO_QUEUE_IMPROVEMENTS: "false"
+  IMPROVE_ENABLED: "false"
+  IMPLEMENT_MODEL: ""
+  REVIEW_MODEL: ""
+  IMPROVE_MODEL: ""
+  BASELINE_TEST_COMMAND: ""
+  POLL_SECONDS: "30"
+  JOB_TIMEOUT_SECONDS: "1800"
+  KUBE_START_TIMEOUT_SECONDS: "300"
+  KUBE_JOB_CPU: "2"
+  KUBE_JOB_MEMORY: 4Gi

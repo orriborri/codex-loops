@@ -6,4 +6,5 @@ COPY loop.py /app/loop.py
 COPY workflow.py /app/workflow.py
 COPY telemetry.py /app/telemetry.py
 COPY reviewing.py baseline.py /app/
+COPY kube_runner.py /app/kube_runner.py
 ENTRYPOINT ["python", "-u", "/app/loop.py"]

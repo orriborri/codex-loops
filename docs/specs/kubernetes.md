@@ -1,0 +1,10 @@
+# Kubernetes runner
+
+Operators can run the existing four Codex loops on Kubernetes without a host Docker socket or privileged container. Docker Compose remains the default and existing behavior must stay intact.
+
+- Run one controller Pod with the existing implement, review, merge and optional improve processes sharing their SQLite database, workspace and file lock on a single-writer filesystem. Keep all existing revision, review, CI, hold and human-approval gates unchanged.
+- Execute implementation, review, improvement and configured baseline tests as disposable Kubernetes Jobs in a separate worker namespace. GitHub and Opik credentials stay in the controller namespace; a model Job receives only the configured model credentials, and test Jobs receive none. Job Pods cannot use a Kubernetes service-account token or privileged/host-mounted resources.
+- An independent review mounts its source and baseline read-only. Job results and source are transferred without exposing controller Git metadata or the whole state volume; unsafe archives, failed jobs and missing outputs never publish source. Bound resources, time, output size and retries.
+- Support existing Codex device sign-in via a writable dedicated authentication PVC in the worker namespace, or an explicitly selected API key secret there. Never silently change authentication modes. Recover and wait for orphaned Jobs before starting another job for the same runner, protecting token refresh serialization.
+- Provide operator-editable Kustomize deployment files suitable for a Flux-managed Talos homelab, using the existing `syno-storage` block CSI class by default, distinct per-role GitHub identities, auto-merge off, and no default public endpoint. Explain secret provisioning, registry images, one-time device sign-in, rollout/rollback, limitations and live validation.
+- Validate Docker compatibility, typed results, restricted job specs, archive safety, cleanup, failure behavior and absence of controller credentials in Jobs. A live cluster is needed to validate scheduling, CSI, image pulls and real Codex sign-in.
